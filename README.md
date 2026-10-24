@@ -103,6 +103,7 @@ player 2 (swap the XInput numbers in the file to change that).
   harness, not in real play.
 - NTSC-U Trilogy only. Local split screen only; Dolphin NetPlay is untested.
 - The charge beam's longer pull range for drops hasn't been seen working in game yet.
+- Players have to jump off of save stations to prevent repeated saving
 
 ## Building the codes
 
