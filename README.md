@@ -102,7 +102,6 @@ player 2 (swap the XInput numbers in the file to change that).
 - Only the opening hours have been played through by people; later areas were checked by a test
   harness, not in real play.
 - NTSC-U Trilogy only. Local split screen only; Dolphin NetPlay is untested.
-- Cutscenes and message boxes use player 1's view.
 - The charge beam's longer pull range for drops hasn't been seen working in game yet.
 
 ## Building the codes
