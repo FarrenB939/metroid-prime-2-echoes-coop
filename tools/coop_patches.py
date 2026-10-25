@@ -31,8 +31,8 @@ Nothing is written to fixed low-memory addresses (0x80001800-0x80003000 belongs 
 when cheats are on). Hook bodies are position-independent: game functions are called through ctr.
 
 rs5mp2 is loaded by the Trilogy front end at runtime, so everything is gated on rs5mp2 being
-resident (three words no patch here touches):
-  0x8014bacc = 4082000c, 0x8023fe68 = 4bfff5f5, 0x804b4854 = 8010cd94
+resident: GATE, three words no patch here touches plus one every 256 KB of its code, so the gate fails as
+soon as another executable starts replacing it (see GATE).
 
 usage:
   coop_patches.py gecko A [B..]        print single features as their own codes (for reading)
@@ -53,6 +53,16 @@ sys.path.insert(0, HERE)                  # ppc; live/check/unpatch also need th
 import ppc  # noqa: E402
 
 GATE = {0x8014bacc: 0x4082000c, 0x8023fe68: 0x4bfff5f5, 0x804b4854: 0x8010cd94}
+# Plus a word every 256 KB of rs5mp2's text (0x80006500-0x804a01a0), each away from any patch site. Leaving Echoes
+# loads the Trilogy front end over it; with only the three words above, the gate still passed for a frame after
+# the front end's code had replaced a hook site, so the code handler wrote a hook branch into the front end
+# (0x80076414 -> the Gecko list) and it crashed into a hook body ("Invalid read from 0x000014f0", 2026-10-24).
+# With a word near every site, the copy (either direction) breaks the gate before it reaches the next site.
+GATE.update({0x80006508: 0x90010c44, 0x80046500: 0x38610354, 0x80086500: 0x980f0024, 0x800c6500: 0x2c030000,
+             0x80106500: 0xd021002c, 0x80146500: 0x7fe6fb78, 0x80186500: 0x987f0084, 0x801c6500: 0xfc401050,
+             0x80206500: 0x38800001, 0x80246500: 0x38a10018, 0x80286500: 0x80070054, 0x802c6500: 0x81830000,
+             0x80306504: 0x90010024, 0x80346500: 0x80840004, 0x80386500: 0x2c0c0000, 0x803c650c: 0x93e1001c,
+             0x80406500: 0x4bfff4d1, 0x80446500: 0x881f0414, 0x80486500: 0x4200ffb8, 0x8049ff00: 0x4bf7a599})
 
 INIT_POWERUP, INCR_PICKUP = 0x8016d998, 0x8016db60
 TELEPORTER_MSG = 0x8022da4c
@@ -583,6 +593,7 @@ def message_on_top():
     a(ppc.lwz(0, F + 4, 1), ppc.mtlr(0), ppc.addi(1, 1, F))
     return a.done()
 
+DATA_NETWORK_OWNER = 0x937f0014            # MEM2: controller index that opened the Data Network (code K)
 HUD_ON_TOP = 0x937f0010                    # MEM2 flag: 1 while a paused HUD (map, menus, scan text) is being drawn
 
 
@@ -637,17 +648,43 @@ FRONT_END_WORLD = 0xdaea74a3               # MLVL of the multiplayer menus
 
 
 def emit_message_mode(a, yes, no):
-    """Branch to `yes` when a message box is open (pause state 6) with 2+ players outside the multiplayer front end
-    (world FRONT_END_WORLD: its menus run in the same state manager), else to `no`. Uses r11 and r12 only: at
-    0x800e8654 r0 holds the caller's saved LR (`mfspr r0,LR` just before; an r0 version broke every return)."""
+    """Branch to `yes` when a message box (pause state 6) or the Data Network (4, player 1's HUD only, see
+    data_network_hud0) is open with 2+ players outside the multiplayer front end (world FRONT_END_WORLD: its menus
+    run in the same state manager), else to `no`. Uses r11 and r12 only: at 0x800e8654 r0 holds the caller's saved
+    LR (`mfspr r0,LR` just before; an r0 version broke every return)."""
     a(*ppc.load32(11, SM_ADDR), ppc.lwz(12, 0x2c0c, 11), ppc.cmpwi(12, 6))
+    a.br('beq', 'mm_state')
+    a(ppc.cmpwi(12, 4))
     a.br('bne', no)
+    a.label('mm_state')
     a(ppc.lwz(12, 0x14f0, 11), ppc.cmpwi(12, 2))
     a.br('blt', no)
     a(*ppc.load32(11, GS_GLOBAL), ppc.lwz(11, 0, 11), ppc.lwz(12, 0, 11), *ppc.load32(11, FRONT_END_WORLD),
       ppc.cmpw(12, 11))
     a.br('beq', no)
     a.br('b', yes)
+
+
+def data_network_open():
+    """Replaces `li r4,3` at 0x800e82d8, the SetPauseState(mgr, 3) of the pause button (action 0x43, Wii 2), with
+    state 4: the single-player Data Network instead of the MP pause menu. Also records which controller pressed it
+    (the action test's result at r1+0x58, +4 = controller index) in DATA_NETWORK_OWNER for code E's input routing.
+    Uses r0 and r4 only."""
+    a = Asm()
+    a(ppc.lwz(0, 0x5c, 1), ppc.lis(4, DATA_NETWORK_OWNER >> 16), ppc.stw(0, DATA_NETWORK_OWNER & 0xffff, 4),
+      ppc.li(4, 4))
+    return a.done()
+
+
+def data_network_hud0():
+    """Replaces `bl FUN_800ddb04(huds, mgr, 4)` at 0x800e8cf4 (pause state 4 handler FUN_800e8ccc), which puts every
+    player's HUD into pause mode 4 (the Data Network; the game resumes only when all have closed theirs). Open it
+    on player 1's HUD only (huds +0x60 = HUD 0, as FUN_800ddb04 walks them): code D shows it full screen like a
+    message box and code E sends every controller's input to that HUD, so any player can browse and close it."""
+    a = Asm()
+    a(ppc.lwz(3, 0x60, 3))
+    a.call(HUD_SET_MODE)
+    return a.done()
 
 
 def single_view_or_message():
@@ -841,6 +878,7 @@ def any_player_crossed():
 
 
 SM_ADDR = 0x804e72e8
+HUD_SET_MODE = 0x80159854                  # (HUD*, mgr, mode): 1/2 map, 3/4 pause (4 = Data Network), 6 message, 7 MP menu
 SPAWN_NOTIFY = 0x8010ca50                  # rules->NotifyPlayers(mgr, idx, idx, 'SPWN', 0) at the end of SpawnPlayer
 DISABLE_FILTER = 0x80056bf8                # CCameraFilterPass::DisableFilter(this, f1 = fade time)
 FILTER_PASSES, FILTER_STRIDE, VIEWPORT_STRIDE = 0x1e98, 0x2c, 0x1e8
@@ -1079,7 +1117,7 @@ def scan_text_box():
     return a.done()
 
 
-PAUSE_STATES_ALLOWED = (0, 1, 3, 5, 6)      # close, map (button 1, code K), MP pause menu (button 2), save, message.
+PAUSE_STATES_ALLOWED = (0, 1, 3, 4, 5, 6)   # close, map (button 1, code K), MP pause menu, data network (button 2, code K), save, message.
 
 
 def message_state_gate():
@@ -1102,10 +1140,18 @@ def message_input_any_remote():
     each controller's input normally goes only to the HUD of the player using that controller (player state
     +0x588 == input +4), and the message box lives in player 1's HUD. While the message box (mgr+0x2c0c == 6)
     or the map (1, opened by any controller with code K) is open, send every controller's input to HUD 0 (first
-    loop iteration) instead."""
+    loop iteration) instead. The Data Network (4, code K) also lives in HUD 0 but keeps only the last input it got,
+    so player 2's idle input wiped player 1's every frame: send it only the input of the controller that opened it
+    (DATA_NETWORK_OWNER) and no other."""
     a = Asm()
     a(ppc.lwz(10, 0x2c0c, 4), ppc.cmpwi(10, 6))
     a.br('beq', 'any')
+    a(ppc.cmpwi(10, 4))
+    a.br('bne', 'map')
+    a(*ppc.load32(10, DATA_NETWORK_OWNER), ppc.lwz(10, 0, 10), ppc.cmpw(10, 0))
+    a.br('bne', 'end')                     # another controller: ne on every iteration -> not dispatched
+    a.br('b', 'any')
+    a.label('map')
     a(ppc.cmpwi(10, 1))
     a.br('bne', 'normal')
     a.label('any')
@@ -1455,7 +1501,7 @@ CODES = {
         words={0x8020e83c: (0x408200a4, ppc.NOP, 'Save station: also under MP rules')},
         hooks=[]),
     'H': dict(
-        name='Echoes co-op: item pickups go to every player (charge beam pulls them in as in single player)',
+        name='Echoes co-op: item pickups go to every player',
         # Pickup Think FUN_801f7d04: a charging player pulls pickups in from 30 units in single player but only
         # 12 under MP rules (`bl IsMP` @0x801f88f8 picks -0x7594(r13) = 12.0 over -0x7598(r13) = 30.0).
         words={0x801f8900: (0x4182000c, ppc.b(0x801f8900, 0x801f890c), 'Charge beam: pull pickups from 30 units (SP range)')},
@@ -1474,14 +1520,23 @@ CODES = {
         words={0x80156e88: (0x41820034, ppc.NOP, 'HUD ctor: always build the map frame object (+0x30)'),
                0x80241854: (0x40820058, ppc.NOP, 'Map button: also with 2+ players'),
                0x8024188c: (0x40820020, ppc.NOP, 'Map button: any controller (not only controller 0)'),
-               0x80159598: (0x418202a8, ppc.NOP, 'HUD: load the single-player HUD texture list (map icons)')},
+               0x80159598: (0x418202a8, ppc.NOP, 'HUD: load the single-player HUD texture list (map icons)'),
+               # Pause button (game action 0x43, Wii 2) in FUN_800e8xxx: SetPauseState(3) = the MP pause menu
+               # (Quit Game). 4 is the single-player Data Network (Inventory, Logbook, scan and item percentages),
+               # opened on every player's HUD; each player's 2 closes theirs and play resumes when all have.
+               # The same press also opened the per-player MP menu (HUD mode 7) unless the mode is 'SNGL', and the
+               # Data Network path above only took controller 0's press.
+               0x800e7f50: (0x41820068, ppc.b(0x800e7f50, 0x800e7fb8), 'Pause button: no per-player MP menu'),
+               0x800e7fc0: (0x4082032c, ppc.NOP, 'Pause button: any controller opens the Data Network')},
         hooks=[(0x801577fc, 0x9421fe80, hud_on_top_begin(), 'Paused HUD (scan text, menus): drawn over the world'),
                (0x80245504, 0x9421fea0, hud_on_top_end(), 'World draw: end of the paused-HUD depth override'),
                (0x803ec8d0, 0x8122cf08, zmode_hud_on_top(), 'GXSetZMode: ALWAYS while the paused HUD draws'),
                (0x80157b84, 0x2c050000, map_only_when_open(), 'Map: no corner minimap with 2+ players'),
                (0x80157c14, 0x4e800421, map_skip_backdrop(), 'Map: no backdrop panel with 2+ players'),
                (0x80157c84, 0x38800006, map_depth_always(), 'Map: ignore world depth with 2+ players'),
-               (0x80157cbc, 0x48210579, map_placement(), 'Map: usable placement with 2+ players')]),
+               (0x80157cbc, 0x48210579, map_placement(), 'Map: usable placement with 2+ players'),
+               (0x800e8cf4, 0x4bff4e11, data_network_hud0(), 'Data Network: player 1 HUD only (full screen, any controller)'),
+               (0x800e82d8, 0x38800003, data_network_open(), 'Pause button: Data Network (state 4), remember who opened it')]),
     'L': dict(
         name='Echoes co-op: shared lives (Kill Limit / 5 per player, refilled when saving; 0 = off)',
         words={},

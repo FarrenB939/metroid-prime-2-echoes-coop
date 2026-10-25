@@ -56,6 +56,9 @@ That starts the campaign instead of the arena.
 - **Enemies and bosses** go after the nearest player, not only player 1.
 - **No friendly fire.**
 - **Map:** button 1 (View on Xbox) on any controller; any player can use it.
+- **Data Network:** button 2 (Menu on Xbox) on any controller opens the single-player pause screen (Scans %,
+  Items %, Inventory, Logbook) full screen; the player who opened it controls it and closes it (2 again, or B
+  at the top).
 - **Save stations and the gunship** work.
 
 ## Lives
@@ -92,7 +95,7 @@ With none ticked, co-op plays on Veteran. The save file's own difficulty doesn't
 | LB / RB | - / + | hold for visor / beam select |
 | D-pad | D-pad | |
 | View | 1 | map |
-| Menu | 2 | multiplayer pause menu (Quit Game) |
+| Menu | 2 | Data Network (pause) |
 
 The Xbox A button is the Wii B button: to close a message box, press RT. Pad 0 is player 1, pad 1
 player 2 (swap the XInput numbers in the file to change that).
@@ -102,8 +105,9 @@ player 2 (swap the XInput numbers in the file to change that).
 - Only the opening hours have been played through by people; later areas were checked by a test
   harness, not in real play.
 - NTSC-U Trilogy only. Local split screen only; Dolphin NetPlay is untested.
-- The charge beam's longer pull range for drops hasn't been seen working in game yet.
 - Players have to jump off of save stations to prevent repeated saving
+- Menu opens the Data Network instead of the multiplayer "Quit Game?" menu; quit from the Data Network's
+  Options.
 
 ## Building the codes
 
