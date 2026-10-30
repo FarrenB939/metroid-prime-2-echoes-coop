@@ -46,7 +46,8 @@ That starts the campaign instead of the arena.
 
 ## What works
 
-- **Rooms:** any player opening a door brings everyone into the next room. Elevators and portals
+- **Rooms:** any player can lead through a door. The others can walk through while it's open; anyone still
+  behind it when it closes is brought through and appears beside the leader. Elevators and portals
   take everyone.
 - **Items:** pickups, expansions and upgrades go to every player. Story events that change items
   (the item loss in Hive Chamber B) apply to everyone, as in single player. Respawns keep items.

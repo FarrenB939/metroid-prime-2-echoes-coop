@@ -22,9 +22,10 @@ B. "campaign session"
 C. "shared room transitions"
    A door (CScriptDock think FUN_801e6a84) switches the current area only when players[0] crosses its
    plane (`bl FUN_801e6cec(dock, mgr, players[0]+0x50)` at 0x801e6bf8). The replacement tests every
-   player; when player k crosses, every other player is teleported near player k (FUN_80160cc4), 2.5 units
-   further into the new room after a collision-ray check, and the area switch proceeds, so nobody is left
-   in a room that unloads.
+   player, so any player switches the room; the others can walk through while the door is open. When the
+   door closes (the dock's DECR, 0x801e6a5c), anyone still in the room behind it is teleported beside the
+   leader (FUN_80160cc4: right, else left, else behind, each spot checked with a collision ray), so nobody
+   is left in a room that unloads.
 
 Hooks use the Gecko C2 (insert ASM) code type, so their code lives in Dolphin's managed code list.
 Nothing is written to fixed low-memory addresses (0x80001800-0x80003000 belongs to the code handler
@@ -780,37 +781,133 @@ def map_placement():
 
 
 PLANE_FROM_POINTS = 0x8033b77c            # (out vec4 {n.xyz, d}, a, b, c); n points to the crossed side
-FOLLOW_STEP = 2.5                          # world units into the new room per follower
+FOLLOW_SIDE = 2.25                         # followers land this far to the leader's right, else left, else behind
 FOLLOW_LIFT = 1.0                          # followers are placed this far up and drop onto the floor
 FOLLOW_MARGIN = 0.5                        # the clearance ray reaches this far past the follower's spot
+AREA_SLACK = 1.0                           # a player counts as inside an area within this distance of its bounds
 RAY_CLEAR = 0x800a2ac8                     # (mgr, &start, &unit dir, &CMaterialFilter, f1 length) -> 1 if no static hit
 MATERIAL_BIT = 0x802b8834                  # (r3:r4 = 64-bit value, r5 = n) -> r3:r4 << n
 SOLID_BIT_SDA = -0x78d8                    # r13-relative: material bit the AI line-of-sight test treats as solid
+DOOR_SET_OPEN = 0x801e6398                 # (bool opened, CGameArea* other side, CWorld*): door opened/closed
+AREA_AABB = 0x3c                           # CGameArea: min xyz at +0x3c, max xyz at +0x48 (memory dump, 2026-10-28)
+CROSS_RANGE = 6.0                          # a dock crossing: past the plane and this close to the door centre
+
+# Frame used by both follow hooks (FOLLOW_F bytes): 0x10..0x1c r26..r29, 0x20 area B, 0x24 area C/A, 0x30 transform
+# (0x30), 0x60 filter (0x14), 0x74 ray start, 0x80 ray dir, 0x8c lift, 0x90 margin, 0x94 side, 0x98 -1.0,
+# 0x9c area slack, 0xa0..0xac saved r3..r6 (door-close hook).
+FOLLOW_F = 0xc0
+_fbits = lambda v: struct.unpack('>I', struct.pack('>f', v))[0]
+
+
+def emit_follow_setup(a):
+    """Constants and the static-collision filter {include = 1 << solid bit, exclude = 0, type 1} (as the AI line of
+    sight test builds it). Clobbers r0, r3-r5 (and volatile registers through the call)."""
+    for off, v in ((0x8c, FOLLOW_LIFT), (0x90, FOLLOW_MARGIN), (0x94, FOLLOW_SIDE), (0x98, -1.0), (0x9c, AREA_SLACK)):
+        a(ppc.lis(0, _fbits(v) >> 16), ppc.stw(0, off, 1))
+    a(ppc.li(3, 0), ppc.li(4, 1), ppc.lwz(5, SOLID_BIT_SDA, 13))
+    a.call(MATERIAL_BIT)
+    a(ppc.stw(3, 0x60, 1), ppc.stw(4, 0x64, 1), ppc.li(0, 0), ppc.stw(0, 0x68, 1), ppc.stw(0, 0x6c, 1),
+      ppc.li(0, 1), ppc.stw(0, 0x70, 1))
+
+
+def emit_in_area(a, player, area_off, mgr, inside, p):
+    """Branch to `inside` if `player`'s position (+0x50) lies within AREA_SLACK of the bounds of the area whose index
+    is stored at area_off(r1); fall through otherwise. Clobbers r0, r9, f0-f2."""
+    a(ppc.lwz(0, area_off, 1), ppc.cmpwi(0, 0))
+    a.br('blt', p + 'no')
+    a(ppc.lwz(9, 0x1dac, mgr), ppc.lwz(9, 0x2c, 9), ppc.slwi(0, 0, 3), ppc.add(9, 9, 0), ppc.lwz(9, 4, 9),
+      ppc.cmpwi(9, 0))
+    a.br('beq', p + 'no')
+    emit_in_bounds(a, player, inside, p)
+
+
+def emit_in_bounds(a, player, inside, p):
+    """Branch to `inside` if `player`'s position (+0x50) lies within AREA_SLACK of the bounds of the area r9 points to;
+    fall through otherwise (label p + 'no'). Clobbers f0-f2."""
+    a(ppc.lfs(2, 0x9c, 1))
+    for k in range(3):
+        a(ppc.lfs(0, 0x50 + 4 * k, player), ppc.lfs(1, AREA_AABB + 4 * k, 9), ppc.fsubs(1, 1, 2), ppc.fcmpo(0, 1))
+        a.br('blt', p + 'no')
+        a(ppc.lfs(1, AREA_AABB + 0xc + 4 * k, 9), ppc.fadds(1, 1, 2), ppc.fcmpo(0, 1))
+        a.br('bgt', p + 'no')
+    a.br('b', inside)
+    a.label(p + 'no')
+
+
+def emit_place_beside(a, follower, leader, mgr, p):
+    """Teleport `follower` next to `leader`: FOLLOW_SIDE to the leader's right (transform column 0), else left, else
+    behind (minus column 1), FOLLOW_LIFT up so they drop onto the floor; each spot is first checked with the static
+    collision ray from the leader's chest to FOLLOW_MARGIN past it. All blocked: the leader's own spot. Facing = the
+    leader's. The morph ball camera is reset too (last argument 1). Clobbers r0, r3-r6, r9, f0-f3."""
+    for k in range(12):                                                    # leader transform -> 0x30
+        a(ppc.lwz(0, 0x20 + 4 * k, leader), ppc.stw(0, 0x30 + 4 * k, 1))
+    for j in range(3):                                                     # ray start = leader + lift on z
+        a(ppc.lfs(0, 0x2c + 0x10 * j, leader))
+        if j == 2:
+            a(ppc.lfs(1, 0x8c, 1), ppc.fadds(0, 0, 1))
+        a(ppc.stfs(0, 0x74 + 4 * j, 1))
+    for n, (col, neg) in enumerate(((0, False), (0, True), (1, True))):
+        a(ppc.lfs(3, 0x98, 1))                                             # -1.0
+        for j in range(3):                                                 # dir = +/- column `col`
+            a(ppc.lwz(9, 0x20 + 4 * col + 0x10 * j, leader), ppc.stw(9, 0x80 + 4 * j, 1))
+            if neg:
+                a(ppc.lfs(0, 0x80 + 4 * j, 1), ppc.fmuls(0, 0, 3), ppc.stfs(0, 0x80 + 4 * j, 1))
+        a(ppc.lfs(1, 0x94, 1), ppc.lfs(0, 0x90, 1), ppc.fadds(1, 1, 0), ppc.mr(3, mgr), ppc.addi(4, 1, 0x74),
+          ppc.addi(5, 1, 0x80), ppc.addi(6, 1, 0x60))
+        a.call(RAY_CLEAR)
+        a(ppc.cmpwi(3, 0))
+        a.br('beq', p + f'try{n + 1}')
+        a(ppc.lfs(1, 0x94, 1))
+        for j in range(3):                                                 # spot = ray start + side * dir
+            a(ppc.lfs(0, 0x74 + 4 * j, 1), ppc.lfs(2, 0x80 + 4 * j, 1), ppc.fmadds(0, 2, 1, 0),
+              ppc.stfs(0, 0x3c + 0x10 * j, 1))
+        a.br('b', p + 'go')
+        a.label(p + f'try{n + 1}')
+    a.label(p + 'go')
+    a(ppc.mr(3, follower), ppc.addi(4, 1, 0x30), ppc.mr(5, mgr), ppc.li(6, 1))
+    a.call(PLAYER_TELEPORT)
 
 
 def any_player_crossed():
     """Replaces `bl DOCK_CROSSED(r3=dock, r4=mgr, r5=players[0]+0x50)` inside the dock think, where the
-    caller keeps r30 = dock and r31 = mgr. Result in r3 like the original call.
+    caller keeps r30 = dock and r31 = mgr. Result in r3 like the original call: any player crossing switches the
+    current room (the caller does it when the other side is loaded). The caller tests once, when the door reports
+    someone passing (dock state 1 -> 2 -> 0), so a crossing is a player past the plane within CROSS_RANGE of the door
+    centre. Testing only "past the plane", a player left waiting in the old room counted too and the current room
+    flipped between the two (a velocity look-back missed real crossings: by the test the walker is already through).
 
-    Followers are teleported to the crossing player's transform moved FOLLOW_STEP * k along the door
-    plane's normal (k = 1, 2, ...), i.e. further into the room being entered, so they neither land on top
-    of the leader nor back on the old side of the door. The spot is checked first with the game's static
-    collision ray (the one the AI line-of-sight test uses), cast from the leader's chest (FOLLOW_LIFT up)
-    along the normal to FOLLOW_MARGIN past the spot. Clear: the follower is placed there FOLLOW_LIFT up and
-    drops onto the floor, so a floor rising after the door can't swallow their feet. Blocked: the follower
-    goes on the leader's own spot instead.
-    Frame: 0x10 r27, 0x14 r28, 0x18 r29, 0x1c step, 0x20 plane, 0x30 transform (0x30), 0x60 filter (0x14),
-    0x74 ray start, 0x80 accumulated offset, 0x84 lift, 0x88 margin."""
-    F = 0x90
+    Players still in the room being left (B) or already in the new one (C) are left alone: they can walk through,
+    and follow_on_door_close brings anyone still behind when the door closes and B unloads. Only players in
+    neither (two or more rooms behind) are brought along now, next to the crossing player (emit_place_beside).
+    (Until 2026-10-28 every other player was teleported at once, FOLLOW_STEP = 2.5 units ahead of the crossing
+    player into the new room, which kept putting them in the way.)
+    Frame: FOLLOW_F (see emit_follow_setup)."""
+    F = FOLLOW_F
     a = Asm()
-    a(ppc.stwu(1, -F, 1), ppc.stw(27, 0x10, 1), ppc.stw(28, 0x14, 1), ppc.stw(29, 0x18, 1), ppc.li(29, 0))
+    a(ppc.stwu(1, -F, 1), ppc.stw(26, 0x10, 1), ppc.stw(27, 0x14, 1), ppc.stw(28, 0x18, 1), ppc.stw(29, 0x1c, 1),
+      ppc.li(29, 0))
+    # door centre (mean of the dock's three plane points, this dock's entry in the current area) -> 0xb0
+    a(ppc.lwz(6, 0x1dac, 31), ppc.lwz(6, 0x2c, 6), ppc.lwz(7, 0x1e44, 31), ppc.slwi(7, 7, 3), ppc.add(6, 6, 7),
+      ppc.lwz(6, 4, 6), ppc.lwz(6, 0x94, 6), ppc.lwz(7, 0x2c8, 30), ppc.mulli(7, 7, 0x48), ppc.add(6, 6, 7),
+      *ppc.load32(0, _fbits(1 / 3)), ppc.stw(0, 0xbc, 1), ppc.lfs(3, 0xbc, 1))
+    for j in range(3):
+        a(ppc.lfs(0, 0x14 + 4 * j, 6), ppc.lfs(1, 0x20 + 4 * j, 6), ppc.fadds(0, 0, 1), ppc.lfs(1, 0x2c + 4 * j, 6),
+          ppc.fadds(0, 0, 1), ppc.fmuls(0, 0, 3), ppc.stfs(0, 0xb0 + 4 * j, 1))
     a.label('loop')
-    a(ppc.slwi(6, 29, 2), ppc.add(6, 6, 31), ppc.lwz(5, 0x14f4, 6), ppc.cmpwi(5, 0))
+    a(ppc.slwi(6, 29, 2), ppc.add(6, 6, 31), ppc.lwz(26, 0x14f4, 6), ppc.cmpwi(26, 0))
     a.br('beq', 'next')
-    a(ppc.addi(5, 5, 0x50), ppc.mr(3, 30), ppc.mr(4, 31))
+    a(ppc.addi(5, 26, 0x50), ppc.mr(3, 30), ppc.mr(4, 31))
     a.call(DOCK_CROSSED)
     a(ppc.cmpwi(3, 0))
-    a.br('bne', 'found')
+    a.br('beq', 'next')
+    # past the plane; it is a crossing only within CROSS_RANGE of the door centre: the dock tests once, when the door
+    # reports someone passing, so whoever just went through is there, while a player waiting further back in the room
+    # behind (also past this dock's plane) is not
+    a(ppc.lfs(2, 0x50, 26), ppc.lfs(0, 0xb0, 1), ppc.fsubs(2, 2, 0), ppc.fmuls(1, 2, 2))
+    for j in (1, 2):
+        a(ppc.lfs(2, 0x50 + 4 * j, 26), ppc.lfs(0, 0xb0 + 4 * j, 1), ppc.fsubs(2, 2, 0), ppc.fmadds(1, 2, 2, 1))
+    a(ppc.lis(0, _fbits(CROSS_RANGE * CROSS_RANGE) >> 16), ppc.stw(0, 0xbc, 1), ppc.lfs(0, 0xbc, 1), ppc.fcmpo(1, 0))
+    a.br('blt', 'found')
     a.label('next')
     a(ppc.addi(29, 29, 1), ppc.lwz(0, 0x14f0, 31), ppc.cmpw(29, 0))
     a.br('blt', 'loop')
@@ -818,62 +915,117 @@ def any_player_crossed():
     a.br('b', 'out')
     a.label('found')
     a(ppc.slwi(6, 29, 2), ppc.add(6, 6, 31), ppc.lwz(28, 0x14f4, 6))                  # r28 = crossing player
-    # plane of this dock in the current area (same lookup as FUN_801e6cec)
-    a(ppc.lwz(6, 0x1dac, 31), ppc.lwz(6, 0x2c, 6), ppc.lwz(7, 0x1e44, 31), ppc.slwi(7, 7, 3), ppc.add(6, 6, 7),
-      ppc.lwz(6, 4, 6), ppc.lwz(6, 0x94, 6), ppc.lwz(7, 0x2c8, 30), ppc.mulli(7, 7, 0x48), ppc.add(6, 6, 7))
-    # only pull followers if the room on the other side is loaded (the caller's own condition, inlined from
-    # FUN_8009af64/FUN_8009af7c: idx = entry->conn[entry->cur]; loaded == areas[idx]+0xd0 == 0x10)
+    # this dock's entry in the current area (B), and the other side's area index (C) if it is loaded (the caller's
+    # own test, inlined from FUN_8009af64/FUN_8009af7c: idx = entry->conn[entry->cur]; loaded: areas[idx]+0xd0 == 0x10)
+    a(ppc.lwz(6, 0x1dac, 31), ppc.lwz(6, 0x2c, 6), ppc.lwz(7, 0x1e44, 31), ppc.stw(7, 0x20, 1), ppc.slwi(7, 7, 3),
+      ppc.add(6, 6, 7), ppc.lwz(6, 4, 6), ppc.lwz(6, 0x94, 6), ppc.lwz(7, 0x2c8, 30), ppc.mulli(7, 7, 0x48),
+      ppc.add(6, 6, 7))
     a(ppc.lwz(7, 4, 6), ppc.cmpwi(7, 0))
     a.br('beq', 'unloaded')
     a(ppc.lwz(7, 0, 6), ppc.slwi(7, 7, 3), ppc.lwz(8, 0xc, 6), ppc.add(8, 8, 7), ppc.lwz(7, 0, 8),
       ppc.lwz(8, 0x1dac, 31), ppc.lwz(9, 0x24, 8), ppc.cmplw(7, 9))
     a.br('bge', 'unloaded')
-    a(ppc.lwz(8, 0x2c, 8), ppc.slwi(7, 7, 3), ppc.add(8, 8, 7), ppc.lwz(8, 4, 8), ppc.lwz(8, 0xd0, 8),
-      ppc.cmpwi(8, 0x10))
+    a(ppc.stw(7, 0x24, 1), ppc.lwz(8, 0x2c, 8), ppc.slwi(7, 7, 3), ppc.add(8, 8, 7), ppc.lwz(8, 4, 8),
+      ppc.lwz(8, 0xd0, 8), ppc.cmpwi(8, 0x10))
     a.br('bne', 'unloaded')
-    a(ppc.addi(3, 1, 0x20), ppc.addi(4, 6, 0x14), ppc.addi(5, 6, 0x20), ppc.addi(6, 6, 0x2c))
-    a.call(PLANE_FROM_POINTS)
-    fbits = lambda v: struct.unpack('>I', struct.pack('>f', v))[0]
-    a(ppc.lis(0, fbits(FOLLOW_STEP) >> 16), ppc.stw(0, 0x1c, 1), ppc.li(0, 0), ppc.stw(0, 0x80, 1),
-      ppc.lis(0, fbits(FOLLOW_LIFT) >> 16), ppc.stw(0, 0x84, 1), ppc.lis(0, fbits(FOLLOW_MARGIN) >> 16),
-      ppc.stw(0, 0x88, 1))
-    # filter {include = 1 << solid bit, exclude = 0, type 1}, built like the AI line-of-sight test does
-    a(ppc.li(3, 0), ppc.li(4, 1), ppc.lwz(5, SOLID_BIT_SDA, 13))
-    a.call(MATERIAL_BIT)
-    a(ppc.stw(3, 0x60, 1), ppc.stw(4, 0x64, 1), ppc.li(0, 0), ppc.stw(0, 0x68, 1), ppc.stw(0, 0x6c, 1),
-      ppc.li(0, 1), ppc.stw(0, 0x70, 1))
-    for k in range(12):                                                                # copy leader transform
-        a(ppc.lwz(0, 0x20 + 4 * k, 28), ppc.stw(0, 0x30 + 4 * k, 1))
+    emit_follow_setup(a)
     a(ppc.li(29, 0))
     a.label('tloop')
     a(ppc.slwi(6, 29, 2), ppc.add(6, 6, 31), ppc.lwz(27, 0x14f4, 6), ppc.cmpwi(27, 0))
     a.br('beq', 'tnext')
     a(ppc.cmpw(27, 28))
     a.br('beq', 'tnext')
-    a(ppc.lfs(1, 0x80, 1), ppc.lfs(0, 0x1c, 1), ppc.fadds(1, 1, 0), ppc.stfs(1, 0x80, 1))   # f1 = k * step
-    for j in range(3):                     # spot = leader + n*f1 (+ lift on z); ray start = leader (+ lift on z)
-        a(ppc.lfs(2, 0x2c + 0x10 * j, 28))
-        if j == 2:
-            a(ppc.lfs(3, 0x84, 1), ppc.fadds(2, 2, 3))
-        a(ppc.stfs(2, 0x74 + 4 * j, 1), ppc.lfs(3, 0x20 + 4 * j, 1), ppc.fmadds(2, 3, 1, 2),
-          ppc.stfs(2, 0x3c + 0x10 * j, 1))
-    a(ppc.lfs(0, 0x88, 1), ppc.fadds(1, 1, 0), ppc.mr(3, 31), ppc.addi(4, 1, 0x74), ppc.addi(5, 1, 0x20),
-      ppc.addi(6, 1, 0x60))
-    a.call(RAY_CLEAR)
-    a(ppc.cmpwi(3, 0))
-    a.br('bne', 'place')
-    for j in range(3):                     # blocked: the leader's own spot
-        a(ppc.lwz(0, 0x2c + 0x10 * j, 28), ppc.stw(0, 0x3c + 0x10 * j, 1))
-    a.label('place')                       # last arg 1: also reset the morph ball camera (as SpawnPlayer does);
-    a(ppc.mr(3, 27), ppc.addi(4, 1, 0x30), ppc.mr(5, 31), ppc.li(6, 1))   # with 0 it flew from the old spot
-    a.call(PLAYER_TELEPORT)
+    emit_in_area(a, 27, 0x20, 31, 'tnext', 'b_')                                       # still in the old room
+    emit_in_area(a, 27, 0x24, 31, 'tnext', 'c_')                                       # already in the new one
+    emit_place_beside(a, 27, 28, 31, 'pl_')
     a.label('tnext')
     a(ppc.addi(29, 29, 1), ppc.lwz(0, 0x14f0, 31), ppc.cmpw(29, 0))
     a.br('blt', 'tloop')
     a.label('unloaded')
     a(ppc.li(3, 1))
     a.label('out')
-    a(ppc.lwz(27, 0x10, 1), ppc.lwz(28, 0x14, 1), ppc.lwz(29, 0x18, 1), ppc.addi(1, 1, F))
+    a(ppc.lwz(26, 0x10, 1), ppc.lwz(27, 0x14, 1), ppc.lwz(28, 0x18, 1), ppc.lwz(29, 0x1c, 1), ppc.addi(1, 1, F))
+    return a.done()
+
+
+def emit_on_area_side(a, player, yes, p):
+    """Branch to `yes` if `player` is on the door-closed room's side of the plane stored at 0xb0(r1) ({n.xyz, d};
+    0x28(r1) = 1 when that room is beyond the plane, 0 when before it). Clobbers r0, f0-f2."""
+    a(ppc.lfs(0, 0x50, player), ppc.lfs(1, 0xb0, 1), ppc.fmuls(0, 0, 1))
+    for j in (1, 2):
+        a(ppc.lfs(2, 0x50 + 4 * j, player), ppc.lfs(1, 0xb0 + 4 * j, 1), ppc.fmadds(0, 2, 1, 0))
+    a(ppc.lwz(0, 0x28, 1), ppc.lfs(1, 0xbc, 1), ppc.fcmpo(0, 1))
+    a.br('blt', p + 'before')
+    a(ppc.cmpwi(0, 1))
+    a.br('beq', yes)
+    a.br('b', p + 'no')
+    a.label(p + 'before')
+    a(ppc.cmpwi(0, 0))
+    a.br('beq', yes)
+    a.label(p + 'no')
+
+
+def follow_on_door_close():
+    """Replaces `bl DOOR_SET_OPEN(r3 = opened, r4 = area on the other side, r5 = world)` at 0x801e6a5c in the dock message handler
+    FUN_801e64bc, cases INCR/DECR, which the door (CScriptDoor) sends its dock on OPEN/CLOS (r29 = dock, r30 = mgr).
+    On DECR (r3 == 0: the door has closed; it stays open while anyone stands in its trigger, so a player can still
+    walk through) every player in the room behind it (r4, A: on A's side of this dock's plane and within A's bounds)
+    is put next to the first player on the other side (emit_place_beside); then the original call runs. Both
+    sides' docks get the DECR; by the second nobody is left in A.
+    Frame: FOLLOW_F (see emit_follow_setup); 0x24 A, 0x28 A beyond the plane, 0xb0 plane."""
+    F = FOLLOW_F
+    a = Asm()
+    a(ppc.stwu(1, -F, 1), ppc.stw(26, 0x10, 1), ppc.stw(27, 0x14, 1), ppc.stw(28, 0x18, 1), ppc.stw(29, 0x1c, 1),
+      ppc.stw(3, 0xa0, 1), ppc.stw(4, 0xa4, 1), ppc.stw(5, 0xa8, 1), ppc.mr(26, 29))   # r26 = dock, r30 = mgr
+    a(ppc.cmpwi(3, 0))
+    a.br('bne', 'call')                                                                 # door opened
+    a(ppc.lwz(0, 0x14f0, 30), ppc.cmpwi(0, 2))
+    a.br('blt', 'call')
+    a(ppc.stw(4, 0x24, 1))
+    # this dock's plane, from its own area's dock list; normal points out of that area
+    a(ppc.lwz(6, 0x1dac, 30), ppc.lwz(6, 0x2c, 6), ppc.lwz(7, 0x2cc, 26), ppc.slwi(7, 7, 3), ppc.add(6, 6, 7),
+      ppc.lwz(6, 4, 6), ppc.lwz(6, 0x94, 6), ppc.lwz(7, 0x2c8, 26), ppc.mulli(7, 7, 0x48), ppc.add(6, 6, 7),
+      ppc.addi(3, 1, 0xb0), ppc.addi(4, 6, 0x14), ppc.addi(5, 6, 0x20), ppc.addi(6, 6, 0x2c))
+    a.call(PLANE_FROM_POINTS)
+    a(ppc.li(0, 0), ppc.lwz(7, 0x2cc, 26), ppc.lwz(8, 0x1e44, 30), ppc.cmpw(7, 8))     # dock's area current: A is
+    a.br('bne', 'side')                                                                 # beyond its plane
+    a(ppc.li(0, 1))
+    a.label('side')
+    a(ppc.stw(0, 0x28, 1))
+    # leader: the first player not on A's side
+    a(ppc.li(29, 0))
+    a.label('lloop')
+    a(ppc.slwi(6, 29, 2), ppc.add(6, 6, 30), ppc.lwz(28, 0x14f4, 6), ppc.cmpwi(28, 0))
+    a.br('beq', 'lnext')
+    emit_on_area_side(a, 28, 'lnext', 'ls_')
+    a.br('b', 'lfound')
+    a.label('lnext')
+    a(ppc.addi(29, 29, 1), ppc.lwz(0, 0x14f0, 30), ppc.cmpw(29, 0))
+    a.br('blt', 'lloop')
+    a.br('b', 'call')                                                                   # everyone is in A
+    a.label('lfound')                                                                   # r28 = leader
+    emit_follow_setup(a)
+    a(ppc.li(29, 0))
+    a.label('tloop')
+    a(ppc.slwi(6, 29, 2), ppc.add(6, 6, 30), ppc.lwz(27, 0x14f4, 6), ppc.cmpwi(27, 0))
+    a.br('beq', 'tnext')
+    a(ppc.cmpw(27, 28))
+    a.br('beq', 'tnext')
+    emit_on_area_side(a, 27, 'aside', 'ts_')
+    a.br('b', 'tnext')
+    a.label('aside')
+    a(ppc.lwz(9, 0x24, 1))
+    emit_in_bounds(a, 27, 'move', 'tb_')
+    a.br('b', 'tnext')
+    a.label('move')
+    emit_place_beside(a, 27, 28, 30, 'pl_')
+    a.label('tnext')
+    a(ppc.addi(29, 29, 1), ppc.lwz(0, 0x14f0, 30), ppc.cmpw(29, 0))
+    a.br('blt', 'tloop')
+    a.label('call')
+    a(ppc.lwz(3, 0xa0, 1), ppc.lwz(4, 0xa4, 1), ppc.lwz(5, 0xa8, 1))
+    a.call(DOOR_SET_OPEN)
+    a(ppc.lwz(26, 0x10, 1), ppc.lwz(27, 0x14, 1), ppc.lwz(28, 0x18, 1), ppc.lwz(29, 0x1c, 1), ppc.addi(1, 1, F))
     return a.done()
 
 
@@ -1483,9 +1635,10 @@ CODES = {
                (MODIFY_DAMAGE, 0x9421ffa0, no_friendly_fire(), 'Damage: players cannot hurt players'),
                (0x80166aac, 0x5460843e, scan_search_fallback(), 'Scan Visor: no id-buffer target -> nearest scannable at the aim, else lock-on')]),
     'C': dict(
-        name='Echoes co-op: shared room transitions (any player opens the next room; others follow)',
+        name='Echoes co-op: shared room transitions (any player opens the next room; others follow when the door closes)',
         words={},
-        hooks=[(0x801e6bf8, 0x480000f5, any_player_crossed(), 'Dock: any player crossing moves everyone'),
+        hooks=[(0x801e6bf8, 0x480000f5, any_player_crossed(), 'Dock: any player crossing switches the room'),
+               (0x801e6a5c, 0x4bfff93d, follow_on_door_close(), 'Door closed: bring players still behind it'),
                (0x801db1f8, 0x807f1514, stop_camera_for_every_player(), 'Camera stop: check every player camera manager')]),
     'F': dict(
         name='Echoes co-op: enemies fight the nearest player (not only player 1)',
