@@ -47,13 +47,13 @@ That starts the campaign instead of the arena.
 ## What works
 
 - **Rooms:** any player can lead through a door. The others can walk through while it's open; anyone still
-  behind it when it closes is brought through and appears beside the leader. Elevators and portals
-  take everyone.
+  behind it when it closes is brought through and appears beside the leader (two Morph Balls fit a tunnel
+  side by side). Big doors work too. Elevators and portals take everyone.
 - **Items:** pickups, expansions and upgrades go to every player. Story events that change items
   (the item loss in Hive Chamber B) apply to everyone, as in single player. Respawns keep items.
 - **Scan Visor:** every player can scan, scan progress is shared, and any player can page the text.
 - **Cutscenes and message boxes** play full screen from player 1's view; everyone is held in place
-  during cutscenes.
+  during cutscenes. **Start (Menu on Xbox) skips a cutscene**, the opening included, even the first time.
 - **Enemies and bosses** go after the nearest player, not only player 1.
 - **No friendly fire.**
 - **Map:** button 1 (View on Xbox) on any controller; any player can use it.
@@ -96,7 +96,7 @@ With none ticked, co-op plays on Veteran. The save file's own difficulty doesn't
 | LB / RB | - / + | hold for visor / beam select |
 | D-pad | D-pad | |
 | View | 1 | map |
-| Menu | 2 | Data Network (pause) |
+| Menu | 2 | Data Network (pause); skip a cutscene |
 
 The Xbox A button is the Wii B button: to close a message box, press RT. Pad 0 is player 1, pad 1
 player 2 (swap the XInput numbers in the file to change that).
