@@ -51,7 +51,8 @@ That starts the campaign instead of the arena.
   side by side). Big doors work too. Elevators and portals take everyone. A player who still ends up outside
   every loaded room (the skybox, a room that unloaded) for about a second is brought to a teammate.
 - **Items:** pickups, expansions and upgrades go to every player. Story events that change items
-  (the item loss in Hive Chamber B) apply to everyone, as in single player. Respawns keep items.
+  (the item loss in Hive Chamber B) apply to everyone, as in single player. Respawns keep items. The
+  charge beam pulls in pickups dropped by crates and enemies, as in single player.
 - **Scan Visor:** every player can scan, scan progress is shared, and any player can page the text. The visor
   picks the scannable object nearest the centre of your view, and objects are tinted as in single player: blue
   not yet scanned, red for important scans, green once scanned.
