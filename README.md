@@ -48,15 +48,19 @@ That starts the campaign instead of the arena.
 
 - **Rooms:** any player can lead through a door. The others can walk through while it's open; anyone still
   behind it when it closes is brought through and appears beside the leader (two Morph Balls fit a tunnel
-  side by side). Big doors work too. Elevators and portals take everyone.
+  side by side). Big doors work too. Elevators and portals take everyone. A player who still ends up outside
+  every loaded room (the skybox, a room that unloaded) for about a second is brought to a teammate.
 - **Items:** pickups, expansions and upgrades go to every player. Story events that change items
   (the item loss in Hive Chamber B) apply to everyone, as in single player. Respawns keep items.
-- **Scan Visor:** every player can scan, scan progress is shared, and any player can page the text.
+- **Scan Visor:** every player can scan, scan progress is shared, and any player can page the text. The visor
+  picks the scannable object nearest the centre of your view, and objects are tinted as in single player: blue
+  not yet scanned, red for important scans, green once scanned.
 - **Cutscenes and message boxes** play full screen from player 1's view; everyone is held in place
   during cutscenes. **Start (Menu on Xbox) skips a cutscene**, the opening included, even the first time.
-- **Enemies and bosses** go after the nearest player, not only player 1.
+- **Enemies and bosses** go after the nearest player still standing, not only player 1. Contact damage and
+  bites hit the player who was touched or bitten.
 - **No friendly fire.**
-- **Map:** button 1 (View on Xbox) on any controller; any player can use it.
+- **Map:** button 1 (View on Xbox) on any controller opens it full screen; any player can use it.
 - **Data Network:** button 2 (Menu on Xbox) on any controller opens the single-player pause screen (Scans %,
   Items %, Inventory, Logbook) full screen; the player who opened it controls it and closes it (2 again, or B
   at the top).
@@ -68,6 +72,8 @@ The team shares a pool of lives, shown in the HUD's centre counters. Set it with
 before choosing Sidehopper Station: lives per player = Kill Limit / 5 (default 10 = 2 each;
 0 = unlimited respawns). Each respawn spends one. With none left, a fallen player watches a
 teammate's view until someone saves (answering Yes), which refills the pool and brings them back.
+When only one player is left standing, that player gets the whole screen. Enemies ignore downed players,
+and message boxes, the map and the Data Network still work when player 1 is the one down.
 If everyone is down with no lives left, the match ends; start Sidehopper Station again to continue
 from the last save.
 
@@ -82,6 +88,19 @@ Hypermode by default. To change it, tick exactly one "Echoes co-op difficulty" c
 | Hypermode (the original Hard mode) | x1.53 | x0.5 |
 
 With none ticked, co-op plays on Veteran. The save file's own difficulty doesn't apply in co-op.
+
+## Options
+
+Off by default. Tick them under Gecko Codes; they take effect when a session starts (Sidehopper Station).
+
+- **Single-player HUD (helmet, minimap, boss health bar):** every player gets single player's HUD with Samus's
+  helmet, the corner minimap and boss health bars (the multiplayer HUD has none). In split screen each half
+  shows it squashed to half height.
+- **Single-player scan screen (logbook progress after a scan):** when a scan completes, the game pauses and the
+  scanning player's view takes the whole screen with single player's scan pane: the logbook category progress,
+  then the scan text. Only the scanning player's controls work it.
+- **Only player 1 appears in cutscenes:** players 2-4 are hidden while a cutscene plays, as if Samus were alone,
+  and reappear when it ends.
 
 ## Controls (`WiimoteNew.ini`, two Xbox controllers)
 
@@ -109,6 +128,8 @@ player 2 (swap the XInput numbers in the file to change that).
 - Players have to jump off of save stations to prevent repeated saving
 - Menu opens the Data Network instead of the multiplayer "Quit Game?" menu; quit from the Data Network's
   Options.
+- A crash was seen once while fighting the small Splinters in the Alpha Splinter's arena; it hasn't happened
+  again in testing.
 
 ## Building the codes
 

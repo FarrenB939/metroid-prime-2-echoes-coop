@@ -22,10 +22,9 @@ B. "campaign session"
 C. "shared room transitions"
    A door (CScriptDock think FUN_801e6a84) switches the current area only when players[0] crosses its
    plane (`bl FUN_801e6cec(dock, mgr, players[0]+0x50)` at 0x801e6bf8). The replacement tests every
-   player, so any player switches the room; the others can walk through while the door is open. When the
-   door closes (the dock's DECR, 0x801e6a5c), anyone still in the room behind it is teleported beside the
-   leader (FUN_80160cc4: right, else left, else behind, each spot checked with a collision ray), so nobody
-   is left in a room that unloads.
+   player; when player k crosses, every other player is teleported near player k (FUN_80160cc4), 2.5 units
+   further into the new room after a collision-ray check, and the area switch proceeds, so nobody is left
+   in a room that unloads.
 
 Hooks use the Gecko C2 (insert ASM) code type, so their code lives in Dolphin's managed code list.
 Nothing is written to fixed low-memory addresses (0x80001800-0x80003000 belongs to the code handler
@@ -64,6 +63,21 @@ GATE.update({0x80006508: 0x90010c44, 0x80046500: 0x38610354, 0x80086500: 0x980f0
              0x80206500: 0x38800001, 0x80246500: 0x38a10018, 0x80286500: 0x80070054, 0x802c6500: 0x81830000,
              0x80306504: 0x90010024, 0x80346500: 0x80840004, 0x80386500: 0x2c0c0000, 0x803c650c: 0x93e1001c,
              0x80406500: 0x4bfff4d1, 0x80446500: 0x881f0414, 0x80486500: 0x4200ffb8, 0x8049ff00: 0x4bf7a599})
+GATE_BASE = (0x8014bacc, 0x8023fe68, 0x804b4854)
+
+
+def gate_lines(sites=None):
+    """The gate as Gecko "if equal" lines. The options patch few sites, so theirs (sites given) keeps the three base
+    words and only the 256 KB words on either side of each of its sites: the same protection the full gate gives
+    those sites, without 23 lines per option in Dolphin's code list."""
+    words = list(GATE)
+    if sites is not None:
+        spread = sorted(a for a in GATE if a not in GATE_BASE)
+        keep = set(GATE_BASE)
+        for site in sites:
+            keep |= {max((a for a in spread if a < site), default=None), min((a for a in spread if a > site), default=None)}
+        words = [a for a in GATE if a in keep]
+    return [f'20{a & 0x1ffffff:06X} {GATE[a]:08X}' for a in words]
 
 INIT_POWERUP, INCR_PICKUP = 0x8016d998, 0x8016db60
 TELEPORTER_MSG = 0x8022da4c
@@ -281,6 +295,18 @@ MATCH_START_END = 0x800ba7d0               # epilogue of the MP match start FUN_
 MP_WORLD_SETUP, GS_REFRESH, GS_REFRESH_94 = 0x800ba230, 0x800bb364, 0x8017e00c   # what the match start ends with
 
 
+def emit_lives(a, tag):
+    """Lives per player from the MP menu (r28 = rules, r31 = game state): rules +0x3c Kill Limit (steps of 5,
+    0 = none), +0x40 bit 0x40 = enabled; then fill the shared pool."""
+    a(ppc.li(7, 0), ppc.lbz(0, 0x40, 28), ppc.andi_(0, 0, 0x40))
+    a.br('beq', tag + '_per')
+    a(ppc.lwz(7, 0x3c, 28), ppc.li(9, KILLS_PER_LIFE), ppc.divwu(7, 7, 9))
+    a.label(tag + '_per')
+    a(*ppc.load32(11, LIVES_ADDR), ppc.stw(7, 4, 11))
+    a(ppc.lwz(8, 0x38, 28), ppc.addi(6, 31, 0x18))                             # rules +0x38: players
+    emit_fill_pool(a, 8, 6, 8, tag)                                            # game state player states, 8 apart
+
+
 def load_coop_save():
     """At MATCH_START_END, when the match goes to the campaign (current world Temple Grounds): load the co-op
     save file (COOP_SLOT) the way single-player Continue does (FUN_800eb088..0dc). An empty file makes the
@@ -339,14 +365,7 @@ def load_coop_save():
         a.br('bl', 'copy')
     a(ppc.addi(12, 12, 8), ppc.addi(5, 5, -1), ppc.cmpwi(5, 0))
     a.br('bne', 'each')
-    # lives per player from the MP menu: rules +0x3c Kill Limit (steps of 5, 0 = none), +0x40 bit 0x40 = enabled
-    a(ppc.li(7, 0), ppc.lbz(0, 0x40, 28), ppc.andi_(0, 0, 0x40))
-    a.br('beq', 'per')
-    a(ppc.lwz(7, 0x3c, 28), ppc.li(9, KILLS_PER_LIFE), ppc.divwu(7, 7, 9))
-    a.label('per')
-    a(*ppc.load32(11, LIVES_ADDR), ppc.stw(7, 4, 11))
-    a(ppc.lwz(8, 0x38, 28), ppc.addi(6, 31, 0x18))                             # rules +0x38: players
-    emit_fill_pool(a, 8, 6, 8, 'lives')                                        # game state player states, 8 apart
+    emit_lives(a, 'lives')
     a.call(MP_WORLD_SETUP)
     a(ppc.mr(3, 31))
     a.call(GS_REFRESH)
@@ -522,15 +541,44 @@ def load_player_count(a, r):
     a(*ppc.load32(r, PLAYER_COUNT), ppc.lwz(r, 0, r))
 
 
+def emit_sp_minimap(a, minimap):
+    """Branch to `minimap` when the HUD (r25) is the single-player HUD (+4 set: the SP HUD option) and the map
+    screen isn't open (mgr r26 +0x2c0c != 1): its frame has single player's corner minimap. Clobbers r12."""
+    a(ppc.lbz(12, 4, 25), ppc.cmpwi(12, 0))
+    a.br('beq', 'spm_no')
+    a(ppc.lwz(12, 0x2c0c, 26), ppc.cmpwi(12, 1))
+    a.br('bne', minimap)
+    a.label('spm_no')
+
+
+def minimap_skip_panel():
+    """Inline at 0x80157c7c (`bctrl`: the model_automapper widget (HUD+0x2c +0xa3c) vt+0x24 Draw, params at r1+0x80;
+    CTR already loaded). In single player that model is invisible behind the corner minimap; in co-op it drew as a
+    pale panel and didn't hide anything (the map needs GX_ALWAYS anyway, see map_depth_always). For the SP HUD
+    option's corner minimap in play skip it: live 2026-10-31, the map then sits on the helmet glass as in single
+    player. Drawn as before on the map screen."""
+    a = Asm()
+    load_player_count(a, 11)
+    a(ppc.cmpwi(11, 2))
+    a.br('blt', 'call')
+    emit_sp_minimap(a, 'skip')
+    a.label('call')
+    a(ppc.BCTRL)
+    a.label('skip')
+    return a.done()
+
+
 def map_only_when_open():
     """At 0x80157b84 (`cmpwi r5,0`: r5 = 1 draws the HUD's map block; r25 = HUD, r26 = mgr). The block draws
     the full map screen and, when the HUD's minimap flag is set, the corner minimap in normal play. With the
     multiplayer HUD frame the minimap would go through the map screen placement below (a huge wireframe over
-    player 1's view), so with 2+ players draw the block only while the map screen is open (pause state 1)."""
+    player 1's view), so with 2+ players draw the block only while the map screen is open (pause state 1). With
+    the single-player HUD option (emit_sp_minimap) the block also draws its corner minimap in play."""
     a = Asm()
     load_player_count(a, 11)
     a(ppc.cmpwi(11, 2))
     a.br('blt', 'keep')
+    emit_sp_minimap(a, 'keep')
     a(ppc.lwz(0, 0x2c0c, 26), ppc.cmpwi(0, 1))
     a.br('beq', 'keep')
     a(ppc.li(5, 0))
@@ -596,6 +644,11 @@ def message_on_top():
 
 DATA_NETWORK_OWNER = 0x937f0014            # MEM2: controller index that opened the Data Network (code K)
 HUD_ON_TOP = 0x937f0010                    # MEM2 flag: 1 while a paused HUD (map, menus, scan text) is being drawn
+SCAN_OWNER = 0x937f001c                    # MEM2: index of the player whose scan paused the game (scan summary option)
+SCAN_SUMMARY_SITE = 0x800d4184             # the scan summary option's `li r3,0` here (was `bl IS_MULTIPLAYER`) tells the
+SCAN_SUMMARY_ON = 0x38600000               # main code the option is on (emit_scan_summary_on)
+SCAN_SUMMARY_TEST = True                   # build the scan summary option's main-code parts (False: main code as before
+                                           # the option, 2026-11-02)
 
 
 def hud_on_top_begin():
@@ -632,6 +685,32 @@ def hud_on_top_end():
     return a.done()
 
 
+# With the single-player HUD, player 2's scan box (drawn by the visor, FUN_80170e0c, before the scan HUD) hid that
+# player's "Scanning..." text and progress bar through the depth buffer: they were set and drawn, showed when moved
+# below the box or with depth testing off, and player 2's scan HUD drawn in player 1's half showed them (live
+# 2026-11-02; why player 1's box leaves no depth there wasn't found; the scan summary option's single-player scan
+# frame hit it too, with the multiplayer HUD). So code E draws the scan HUD frame with z compare off: a flag set
+# around its draw (bl 0x80399038 at 0x800d3e84) makes the z-mode wrapper 0x8030817c pass enable = 0, then the frame
+# draw's own closing z mode (on, LEQUAL, update) is set again.
+SCAN_HUD_ZOFF = 0x937f0018                 # MEM2 flag: 1 while the scan HUD frame is drawn (code E)
+ZMODE_SITE, ZMODE_ORIG = 0x8030817c, 0x548015ba
+SCAN_HUD_DRAW = 0x800d3e84                 # bl 0x80399038 (frame draw) in the scan HUD draw FUN_800d3e4c
+
+
+def scan_hud_zmode():
+    """Body at the z-mode wrapper's first instruction (ZMODE_SITE): enable = 0 while SCAN_HUD_ZOFF is set."""
+    hi, lo = SCAN_HUD_ZOFF >> 16, SCAN_HUD_ZOFF & 0xffff
+    return [ppc.lis(12, hi), ppc.lbz(12, lo, 12), ppc.cmpwi(12, 0), 0x41820008, ppc.li(3, 0), ZMODE_ORIG]  # beq +8
+
+
+def scan_hud_draw():
+    """Replaces the scan HUD's frame draw call (SCAN_HUD_DRAW): draw it with SCAN_HUD_ZOFF set."""
+    hi, lo = SCAN_HUD_ZOFF >> 16, SCAN_HUD_ZOFF & 0xffff
+    return [ppc.lis(12, hi), ppc.li(0, 1), ppc.stb(0, lo, 12), *ppc.load32(12, 0x80399038), ppc.mtctr(12), 0x4e800421,
+            ppc.lis(12, hi), ppc.li(0, 0), ppc.stb(0, lo, 12),
+            ppc.li(3, 1), ppc.li(4, 3), ppc.li(5, 1), *ppc.load32(12, 0x803725d4), ppc.mtctr(12), 0x4e800421]
+
+
 def zmode_hud_on_top():
     """At GXSetZMode 0x803ec8d0 (r3 enable, r4 compare func, r5 update; first instruction `lwz r9,-0x30f8(r2)`),
     which both the cached setter FUN_8030817c and the model material code call: while HUD_ON_TOP is set, compare
@@ -649,11 +728,13 @@ FRONT_END_WORLD = 0xdaea74a3               # MLVL of the multiplayer menus
 
 
 def emit_message_mode(a, yes, no):
-    """Branch to `yes` when a message box (pause state 6) or the Data Network (4, player 1's HUD only, see
-    data_network_hud0) is open with 2+ players outside the multiplayer front end (world FRONT_END_WORLD: its menus
+    """Branch to `yes` when a message box (pause state 6), the Data Network (4, player 1's HUD only, see
+    data_network_hud0) or the map (1; full screen since 2026-11-01) is open with 2+ players outside the multiplayer front end (world FRONT_END_WORLD: its menus
     run in the same state manager), else to `no`. Uses r11 and r12 only: at 0x800e8654 r0 holds the caller's saved
     LR (`mfspr r0,LR` just before; an r0 version broke every return)."""
     a(*ppc.load32(11, SM_ADDR), ppc.lwz(12, 0x2c0c, 11), ppc.cmpwi(12, 6))
+    a.br('beq', 'mm_state')
+    a(ppc.cmpwi(12, 1))
     a.br('beq', 'mm_state')
     a(ppc.cmpwi(12, 4))
     a.br('bne', no)
@@ -688,16 +769,83 @@ def data_network_hud0():
     return a.done()
 
 
+def emit_scan_summary_on(a):
+    """cr0.eq = the scan summary option is on (its word at SCAN_SUMMARY_SITE). Uses r11 and r12 only."""
+    a(*ppc.load32(11, SCAN_SUMMARY_SITE), ppc.lwz(12, 0, 11), ppc.lis(11, SCAN_SUMMARY_ON >> 16), ppc.cmpw(12, 11))
+
+
+def emit_scan_pause_mode(a, yes, no):
+    """Branch to `yes` during the scan summary option's scan pause (mgr +0x1e88 == 1, see scan_text_box) with 2+
+    players, else to `no`. The scanning player's view and HUD then get the whole screen (emit_scan_owner), as the
+    scan pane does in single player. Uses r11 and r12 only. Emits nothing outside SCAN_SUMMARY_TEST: every caller's
+    `no` is the code right after it."""
+    if not SCAN_SUMMARY_TEST:
+        return
+    emit_scan_summary_on(a)
+    a.br('bne', no)
+    a(*ppc.load32(11, SM_ADDR), ppc.lwz(12, 0x1e88, 11), ppc.cmpwi(12, 1))
+    a.br('bne', no)
+    a(ppc.lwz(12, 0x14f0, 11), ppc.cmpwi(12, 2))
+    a.br('blt', no)
+    a.br('b', yes)
+
+
+def emit_scan_owner(a, vp, done):
+    """During emit_scan_pause_mode, viewport 0 (the whole screen then) shows the scanning player: set `vp` to their
+    index and branch to `done`. Uses r11 and r12 only. Nothing outside SCAN_SUMMARY_TEST."""
+    if not SCAN_SUMMARY_TEST:
+        return
+    a(ppc.cmpwi(vp, 0))
+    a.br('bne', 'so_out')
+    emit_scan_pause_mode(a, 'so_yes', 'so_out')
+    a.label('so_yes')
+    a(*ppc.load32(11, SCAN_OWNER), ppc.lwz(vp, 0, 11))
+    a.br('b', done)
+    a.label('so_out')
+
+
+def emit_survivor_mode(a, yes, no):
+    """Branch to `yes` when only one player is up and the others are held down with no lives left (code L, pool 0)
+    with 2+ players outside the multiplayer front end, else to `no`. That player then gets the whole screen: a
+    downed player's half only repeated their view (playtest 2026-10-31). Uses r9-r12 only (r0 is the caller's
+    saved LR at 0x800e8654)."""
+    a(*ppc.load32(11, SM_ADDR), ppc.lwz(12, 0x14f0, 11), ppc.cmpwi(12, 2))
+    a.br('blt', no)
+    a(*ppc.load32(10, LIVES_ADDR), ppc.lwz(10, 0, 10), ppc.cmpwi(10, 0))
+    a.br('bne', no)
+    a(ppc.li(9, 0))
+    a.label('sv_loop')                                                          # r9 = players up
+    a(ppc.addi(12, 12, -1), ppc.slwi(10, 12, 2), ppc.add(10, 10, 11), ppc.lwz(10, 0x1504, 10), ppc.lbz(10, 4, 10),
+      ppc.andi_(10, 10, 0x80))
+    a.br('beq', 'sv_down')
+    a(ppc.addi(9, 9, 1))
+    a.label('sv_down')
+    a(ppc.cmpwi(12, 0))
+    a.br('bgt', 'sv_loop')
+    a(ppc.cmpwi(9, 1))
+    a.br('bne', no)
+    a(*ppc.load32(11, GS_GLOBAL), ppc.lwz(11, 0, 11), ppc.lwz(12, 0, 11), *ppc.load32(11, FRONT_END_WORLD),
+      ppc.cmpw(12, 11))
+    a.br('beq', no)
+    a.br('b', yes)
+
+
 def single_view_or_message():
     """Replaces the `bl` to the 'single full-screen view' test (code D: CINEMATIC_ACTIVE on player 1's camera manager)
     in the top-level draw (0x800e88a4) and the viewport layout (0x8024b584). Also true while a message box (scan
     text, save and script messages) is open with 2+ players, so it gets the whole screen over player 1's view, as in
-    single player; message_hud_* keep the HUD pass running for player 1's HUD, which draws the box."""
+    single player; message_hud_* keep the HUD pass running for player 1's HUD, which draws the box. And true while
+    only one player is up with no lives left (emit_survivor_mode): viewport 0 then shows that player full screen
+    (code L's spectate hooks swap in their camera and HUD when player 1 is the one down)."""
     a = Asm()
     a.call(CINEMATIC_ACTIVE)
     a(ppc.cmpwi(3, 0))
     a.br('bne', 'out')
-    emit_message_mode(a, 'msg', 'out')
+    emit_message_mode(a, 'msg', 'scan')
+    a.label('scan')
+    emit_scan_pause_mode(a, 'msg', 'surv')
+    a.label('surv')
+    emit_survivor_mode(a, 'msg', 'out')
     a.label('msg')
     a(ppc.li(3, 1))
     a.label('out')
@@ -706,9 +854,14 @@ def single_view_or_message():
 
 def message_hud_pass():
     """Replaces `cmpwi r4,0` at 0x800e8654 in the HUD pass FUN_800e864c (r4 = 'single view' flag, which skips the
-    HUD loop: cinematics have no HUD). While a message box is open, run the loop anyway (it draws the box)."""
+    HUD loop: cinematics have no HUD). While a message box is open, run the loop anyway (it draws the box); also for
+    a lone survivor's full-screen view."""
     a = Asm()
-    emit_message_mode(a, 'msg', 'normal')
+    emit_message_mode(a, 'msg', 'scan')
+    a.label('scan')
+    emit_scan_pause_mode(a, 'msg', 'surv')
+    a.label('surv')
+    emit_survivor_mode(a, 'msg', 'normal')
     a.label('msg')
     a(ppc.cmplw(4, 4))                                                          # eq: as if the flag were 0
     a.br('b', 'out')
@@ -720,9 +873,13 @@ def message_hud_pass():
 
 def message_hud_count():
     """Replaces `lwz r0,0x14f0(r3)` at 0x800e870c, the HUD loop bound (r3 = mgr): while a message box is open, draw
-    player 1's HUD only (its viewport is the whole screen then)."""
+    player 1's HUD only (its viewport is the whole screen then); likewise for a lone survivor's full-screen view."""
     a = Asm()
-    emit_message_mode(a, 'msg', 'normal')
+    emit_message_mode(a, 'msg', 'scan')
+    a.label('scan')
+    emit_scan_pause_mode(a, 'msg', 'surv')
+    a.label('surv')
+    emit_survivor_mode(a, 'msg', 'normal')
     a.label('msg')
     a(ppc.li(0, 1))
     a.br('b', 'out')
@@ -734,11 +891,14 @@ def message_hud_count():
 def map_skip_backdrop():
     """Inline at 0x80157c14 (`bctrl` to (HUD frame +0x4e4)->+0x14 vt+0x24, CTR already loaded) in the HUD's map
     mode draw: that widget is single player's dimmed backdrop; the multiplayer HUD frame's version is a pale
-    panel drawn over the map. With 2+ players skip the call."""
+    panel drawn over the map. With 2+ players skip the call (not for the SP HUD option's corner minimap)."""
     a = Asm()
     load_player_count(a, 11)
     a(ppc.cmpwi(11, 2))
-    a.br('bge', 'skip')
+    a.br('blt', 'call')
+    emit_sp_minimap(a, 'call')
+    a.br('b', 'skip')
+    a.label('call')
     a(ppc.BCTRL)
     a.label('skip')
     return a.done()
@@ -747,7 +907,8 @@ def map_skip_backdrop():
 def map_depth_always():
     """Inline at 0x80157c84 (`li r4,6`: the HUD sets z-compare GEQUAL, no update, for the map). Single player's
     paused screen shows a captured image, so the map draws on a cleared depth buffer; in co-op the live world
-    fills it and hides the map. With 2+ players use GX_ALWAYS (7)."""
+    fills it and hides the map. With 2+ players use GX_ALWAYS (7); the SP HUD option's corner minimap needs it
+    too (with GEQUAL it was hidden behind the world, live 2026-10-31)."""
     a = Asm()
     a(ppc.li(4, 6))
     load_player_count(a, 11)
@@ -762,7 +923,8 @@ def map_placement():
     """Replaces `bl MTX_CONCAT(r3 = out, r4 = scale, r5 = HUD+0x1e4)` at 0x80157cbc: the map's placement in the
     HUD is computed from anchor nodes of the HUD frame, and the multiplayer frame's anchors give a tiny map
     (scale 0.35 at depth -36). With 2+ players concatenate with MAP_XF_MP instead (single player's depth,
-    scaled to the half-height co-op view; +/- zoom works on top)."""
+    scaled to the half-height co-op view; +/- zoom works on top). The SP HUD option's corner minimap keeps its
+    frame's placement (MAP_XF_MP filled the whole view with it)."""
     a = Asm()
     a.br('b', 'start')
     a.label('data')
@@ -771,6 +933,7 @@ def map_placement():
     load_player_count(a, 11)
     a(ppc.cmpwi(11, 2))
     a.br('blt', 'call')
+    emit_sp_minimap(a, 'call')
     a.br('bl', 'here')
     a.label('here')
     a(ppc.mflr(5))
@@ -1123,6 +1286,90 @@ def follow_on_door_close():
     return a.done()
 
 
+STRAND_COUNT = 0x937f0080                  # MEM2: u32 per player, frames spent outside every loaded room
+STRAND_FRAMES = 60                         # ~1 s outside every loaded room -> brought to a partner
+STRAND_SLACK = 3.0                         # a player counts as inside a loaded room within this of its bounds
+RULES_FRAME_CALL = 0x8010d528              # called every frame at the start of the deathmatch rules update
+
+
+def rescue_stranded_player():
+    """Replaces `bl RULES_FRAME_CALL` (r3 = rules, r4 = mgr) at 0x80076320, the start of the deathmatch rules update
+    FUN_800762e8, which runs every frame of a co-op session. Makes the original call, then: a player who is up
+    (state +4 & 0x80) and has been outside the bounds of every loaded room (world +0x2c areas, CGameArea +0xd0 ==
+    0x10) for STRAND_FRAMES frames is put next to the first other player who is up and inside a loaded room
+    (emit_place_beside). The door follow (follow_on_door_close) decides who was left behind with the door's plane
+    and the room's bounds, and sometimes missed a player, who stayed in the room that then unloaded and stood in
+    the skybox (playtest 2026-10-31); this catches that whatever the cause.
+    Frame: FOLLOW_F (see emit_follow_setup), 0x10..0x1c r26..r29. r28 mgr, r27 slot, r26 player, r29 partner."""
+    F = FOLLOW_F
+    a = Asm()
+    a.call(RULES_FRAME_CALL)
+    a(ppc.stwu(1, -F, 1), ppc.stw(26, 0x10, 1), ppc.stw(27, 0x14, 1), ppc.stw(28, 0x18, 1), ppc.stw(29, 0x1c, 1),
+      *ppc.load32(28, SM_ADDR), ppc.lwz(0, 0x14f0, 28), ppc.cmpwi(0, 2))
+    a.br('blt', 'done')
+    a(ppc.li(27, 0))
+    a.label('loop')
+    a(ppc.lis(0, _fbits(STRAND_SLACK) >> 16), ppc.stw(0, 0x9c, 1),
+      ppc.slwi(5, 27, 2), *ppc.load32(8, STRAND_COUNT), ppc.add(8, 8, 5), ppc.add(6, 5, 28),
+      ppc.lwz(26, 0x14f4, 6), ppc.lwz(7, 0x1504, 6), ppc.lwz(6, 0, 8), ppc.addi(6, 6, 1), ppc.cmpwi(26, 0))
+    a.br('beq', 'zero')
+    a(ppc.lbz(7, 4, 7), ppc.andi_(7, 7, 0x80))
+    a.br('beq', 'zero')                                                            # down: not counted
+    a(ppc.mr(3, 26))
+    a.br('bl', 'loaded')
+    a(ppc.cmpwi(3, 0))
+    a.br('bne', 'zero')
+    a(ppc.stw(6, 0, 8), ppc.cmpwi(6, STRAND_FRAMES))
+    a.br('blt', 'next')
+    a(ppc.li(29, 0))                                                               # partner: up, in a loaded room
+    a.label('ploop')
+    a(ppc.cmpw(29, 27))
+    a.br('beq', 'pnext')
+    a(ppc.slwi(6, 29, 2), ppc.add(6, 6, 28), ppc.lwz(3, 0x14f4, 6), ppc.lwz(7, 0x1504, 6), ppc.cmpwi(3, 0))
+    a.br('beq', 'pnext')
+    a(ppc.lbz(7, 4, 7), ppc.andi_(7, 7, 0x80))
+    a.br('beq', 'pnext')
+    a(ppc.stw(3, 0x20, 1))
+    a.br('bl', 'loaded')
+    a(ppc.cmpwi(3, 0))
+    a.br('bne', 'pfound')
+    a.label('pnext')
+    a(ppc.addi(29, 29, 1), ppc.lwz(0, 0x14f0, 28), ppc.cmpw(29, 0))
+    a.br('blt', 'ploop')
+    a.br('b', 'next')                                                              # nobody to go to: keep counting
+    a.label('pfound')
+    a(ppc.lwz(29, 0x20, 1))
+    emit_follow_setup(a)
+    emit_place_beside(a, 26, 29, 28, 'pl_')
+    a(ppc.slwi(8, 27, 2), *ppc.load32(9, STRAND_COUNT), ppc.add(8, 8, 9))
+    a.label('zero')
+    a(ppc.li(0, 0), ppc.stw(0, 0, 8))
+    a.label('next')
+    a(ppc.addi(27, 27, 1), ppc.lwz(0, 0x14f0, 28), ppc.cmpw(27, 0))
+    a.br('blt', 'loop')
+    a.br('b', 'done')
+    a.label('loaded')                     # r3 = player -> r3 = 1 if inside a loaded room's bounds. r0, r9-r12, f0-f2
+    a(ppc.lwz(10, 0x1dac, 28), ppc.lwz(11, 0x24, 10), ppc.lwz(10, 0x2c, 10), ppc.li(12, 0))
+    a.label('aloop')
+    a(ppc.cmpw(12, 11))
+    a.br('bge', 'anone')
+    a(ppc.slwi(0, 12, 3), ppc.add(9, 10, 0), ppc.lwz(9, 4, 9), ppc.cmpwi(9, 0))
+    a.br('beq', 'anext')
+    a(ppc.lwz(0, 0xd0, 9), ppc.cmpwi(0, 0x10))
+    a.br('bne', 'anext')
+    emit_in_bounds(a, 3, 'ayes', 'ab_')
+    a.label('anext')
+    a(ppc.addi(12, 12, 1))
+    a.br('b', 'aloop')
+    a.label('anone')
+    a(ppc.li(3, 0), ppc.BLR)
+    a.label('ayes')
+    a(ppc.li(3, 1), ppc.BLR)
+    a.label('done')
+    a(ppc.lwz(26, 0x10, 1), ppc.lwz(27, 0x14, 1), ppc.lwz(28, 0x18, 1), ppc.lwz(29, 0x1c, 1), ppc.addi(1, 1, F))
+    return a.done()
+
+
 SM_ADDR = 0x804e72e8
 HUD_SET_MODE = 0x80159854                  # (HUD*, mgr, mode): 1/2 map, 3/4 pause (4 = Data Network), 6 message, 7 MP menu
 SPAWN_NOTIFY = 0x8010ca50                  # rules->NotifyPlayers(mgr, idx, idx, 'SPWN', 0) at the end of SpawnPlayer
@@ -1212,6 +1459,26 @@ def lives_unfade_partners():
     return a.done()
 
 
+SPAWN_LOOP_NEXT = 0x8020c7fc               # spawn point teleport loop: next player
+
+
+def spawn_point_skip_down():
+    """At 0x8020c6b8 (`lwz r25,0x4(r27)`), the top of the per-player teleport loop in the spawn point's RSET/ZERO
+    handler FUN_8020c5f4 (r27 = spawn point, r28 = mgr, r30 = mgr + 4 * player). It moved a downed player's body
+    too: after the Alpha Splinter's defeat cutscene player 1, down with no lives left, stood beside player 2 and
+    drifted upward (a downed player gets no physics), with 99 HP (live 2026-10-31). With 2+ players skip players
+    who are down; their body stays where it fell, and they respawn beside a partner when revived."""
+    a = Asm()
+    a(ppc.lwz(11, 0x14f0, 28), ppc.cmpwi(11, 2))
+    a.br('blt', 'keep')
+    a(ppc.lwz(11, 0x1504, 30), ppc.lbz(11, 4, 11), ppc.andi_(11, 11, 0x80))
+    a.br('bne', 'keep')
+    a(*far_to(SPAWN_LOOP_NEXT))
+    a.label('keep')
+    a(0x833b0004)                                                               # lwz r25,0x4(r27)
+    return a.done()
+
+
 def emit_spectate_target(a, mgr, vp):
     """While the pool is empty and player `vp` is down, set `vp` to the first player who is up. Uses r0, r8-r11."""
     a(*ppc.load32(11, LIVES_ADDR), ppc.lwz(0, 0, 11), ppc.cmpwi(0, 0))
@@ -1242,17 +1509,53 @@ def lives_spectate():
        stay vp's).
     2. lives_spectate_hud: a dead player's HUD covers its viewport in black, so draw the partner's HUD there."""
     a = Asm()
+    emit_scan_owner(a, 31, 'go')
     emit_spectate_target(a, 30, 31)
+    a.label('go')
     a(0x57e0103a)                                                               # rlwinm r0,r31,2,0,29
     return a.done()
 
 
 def lives_spectate_hud():
     """At 0x800dd9cc (`rlwinm r0,r31,3,0,28`) in FUN_800dd98c(game, mgr, vp), before it draws HUD
-    (game+0x60+8*vp); r30 = mgr, r31 = vp (restored on return, unused after the draw)."""
+    (game+0x60+8*vp); r30 = mgr, r31 = vp (restored on return, unused after the draw).
+    Not while the map, the Data Network or a message box is open (pause states 1, 4, 6): those live in player 1's
+    HUD, so with player 1 down the partner's HUD showed none of them (playtest 2026-10-31: no scan text). Player
+    1's HUD is drawn then, without its death cover (hud_death_cover)."""
     a = Asm()
-    emit_spectate_target(a, 30, 31)
+    emit_scan_owner(a, 31, 'out')
+    a(ppc.lwz(0, 0x2c0c, 30))
+    for state in PAUSED_HUD0_STATES:
+        a(ppc.cmpwi(0, state))
+        a.br('beq', 'out')
+    emit_spectate_target(a, 30, 31)                                             # ends at its label 'out'
     a(0x57e01838)                                                               # rlwinm r0,r31,3,0,28
+    return a.done()
+
+
+PAUSED_HUD0_STATES = (1, 4, 6)             # map, Data Network, message box: drawn by player 1's HUD
+HUD_COVER_SKIP = 0x80158128                # end of the HUD draw's death cover block
+
+
+def hud_death_cover():
+    """Replaces `ble 0x80158128` at 0x80157d6c in the HUD draw FUN_801577fc (f31 = its player's +0x127c, > 0
+    while dead): the block it skips covers a dead player's view (drawn after the message window at 0x80157d20).
+    With 2+ players and the map, the Data Network or a message box open, skip it too, so player 1's HUD shows them
+    while player 1 is down (lives_spectate_hud). Uses r11 and r12 (free here; the block reloads what it needs)."""
+    a = Asm()
+    a.br('bgt', 'cover')
+    a(*far_to(HUD_COVER_SKIP))
+    a.label('cover')
+    a(*ppc.load32(11, SM_ADDR), ppc.lwz(12, 0x14f0, 11), ppc.cmpwi(12, 2))
+    a.br('blt', 'out')
+    a(ppc.lwz(12, 0x2c0c, 11))
+    for state in PAUSED_HUD0_STATES:
+        a(ppc.cmpwi(12, state))
+        a.br('beq', 'skip')
+    a.br('b', 'out')
+    a.label('skip')
+    a(*far_to(HUD_COVER_SKIP))
+    a.label('out')
     return a.done()
 
 
@@ -1340,12 +1643,30 @@ def scan_text_box():
     """Replaces `bl IS_MULTIPLAYER` at 0x80149ee8 in SetScanningState's 'scan complete' branch (r29 = mgr,
     r30 = player; the original then skips single-player's scan pane when multiplayer). Under MP rules, show
     the scanned object's scan text in the game's paused message box instead, and return 1 so the pane stays
-    skipped. Single-player rules: returns 0, unchanged behaviour."""
+    skipped. Single-player rules: returns 0, unchanged behaviour. With the scan summary option on, also return 0:
+    single player's scan pause (mgr +0x1e88 = 1; the world stops and the player's scan frame shows the logbook
+    categories and the text, A pages, letting go of the lock button closes it), with that player's index in
+    SCAN_OWNER for emit_scan_pause_mode; while another player's pane is up, the message box as before."""
     a = Asm()
     a(ppc.stwu(1, -0x20, 1), ppc.mr(3, 29))
     a.call(IS_MULTIPLAYER)
     a(ppc.cmpwi(3, 0))
     a.br('beq', 'out')
+    if SCAN_SUMMARY_TEST:
+        emit_scan_summary_on(a)
+        a.br('bne', 'box')
+        a(ppc.lwz(12, 0x1e88, 29), ppc.cmpwi(12, 0))   # another player's pane is up: this one gets the message box
+        a.br('bne', 'box')
+        a(ppc.lwz(12, 0x14f0, 29))                 # scan summary option: note whose scan it is, take the SP path
+        a.label('own')
+        a(ppc.addi(12, 12, -1), ppc.slwi(0, 12, 2), ppc.add(3, 0, 29), ppc.lwz(3, 0x14f4, 3), ppc.cmpw(3, 30))
+        a.br('beq', 'owner')
+        a(ppc.cmpwi(12, 0))
+        a.br('bgt', 'own')
+        a.label('owner')
+        a(*ppc.load32(11, SCAN_OWNER), ppc.stw(12, 0, 11), ppc.li(3, 0))
+        a.br('b', 'out')
+    a.label('box')
     a(ppc.lhz(0, 0x39c, 30), ppc.sth(0, 0x8, 1), ppc.mr(3, 29), ppc.addi(4, 1, 0x8))
     a.call(OBJECT_BY_ID)
     a.call(CAST_ACTOR)
@@ -1361,6 +1682,43 @@ def scan_text_box():
     a(ppc.li(3, 1))
     a.label('out')
     a(ppc.addi(1, 1, 0x20))
+    return a.done()
+
+
+def scan_pause_owner():
+    """Replaces `bl ScanPause(mgr, 0)` at 0x80149d68, at the start of SetScanningState (r29 = mgr, r30 = player):
+    any change of a player's scan state ends the scan pause. In single player that is how the scan pane closes (the
+    player lets go of the lock button); in co-op the other players' scans would close it too, so during the scan
+    summary option's pause only the scanning player's changes end it."""
+    a = Asm()
+    emit_scan_summary_on(a)
+    a.br('bne', 'call')
+    a(ppc.lwz(12, 0x1e88, 29), ppc.cmpwi(12, 1))
+    a.br('bne', 'call')
+    a(*ppc.load32(11, SCAN_OWNER), ppc.lwz(12, 0, 11), ppc.slwi(12, 12, 2), ppc.add(12, 12, 29),
+      ppc.lwz(12, 0x14f4, 12), ppc.cmpw(12, 30))
+    a.br('bne', 'out')
+    a.label('call')
+    a.call(0x8024b1d4)
+    a.label('out')
+    return a.done()
+
+
+def scan_pause_picture():
+    """Replaces `cmpwi r24,2` at 0x80170844 in the visor update FUN_801707a4 (r24 = its player's scan state, r31 =
+    mgr): a completed scan fades the scan box's picture out (+0x30 -> 0; the box draws the screen copy only while it
+    is nonzero). During the scan summary option's pause that left player 2's box dark in the full-screen pane (live
+    2026-11-02; holding +0x30 at 1 brought the picture back), so compare as if the scan were still running."""
+    a = Asm()
+    emit_scan_summary_on(a)
+    a.br('bne', 'orig')
+    a(ppc.lwz(12, 0x1e88, 31), ppc.cmpwi(12, 1))
+    a.br('bne', 'orig')
+    a(ppc.cmpwi(24, 3))                                                         # not equal: fade the picture in
+    a.br('b', 'out')
+    a.label('orig')
+    a(ppc.cmpwi(24, 2))
+    a.label('out')
     return a.done()
 
 
@@ -1422,15 +1780,22 @@ def scan_in_multiplayer():
     player is mgr+0x1da0, the player of the viewport being drawn: always Samus in single player, but in split
     screen that's set only while drawing (0 otherwise), so player 2's data never updated and the scan search
     found nothing for them. Call it for every player (0x80148578 `bne` over the call).
-    scan_search_fallback() covers the rest."""
+    scan_search_fallback() covers the rest.
+    Scan Visor highlights FUN_800bd9f0 (per player: the objects tinted blue unscanned / red critical / green
+    scanned, coloured by FUN_800be42c): under MP rules it lists only the other players (`beq` at 0x800bdc44 after
+    IsMultiplayer), so co-op tinted nothing by scan state (playtest 2026-10-31: scanned objects never went green).
+    Always take single player's path, which lists the scannable actors in view."""
     return {0x8014a0e8: (0x4182000c, ppc.b(0x8014a0e8, 0x8014a0f4), 'Scan: allow scanning objects under MP rules'),
+            0x800bdc44: (0x41820048, ppc.b(0x800bdc44, 0x800bdc8c), 'Scan Visor: highlight scannable objects by scan state'),
             0x80166a88: (0x40820030, ppc.NOP, 'Scan Visor: use the scan target search under MP rules'),
             0x80148578: (0x40820008, ppc.NOP, 'Scan Visor: update scan aim data for every player')}
 
 
 CAST_TO_ACTOR = 0x8029fd70                # CEntity* -> CActor* or 0
 SCAN_PICK_RANGE = 40.0                     # Scan Visor fallback picker: max distance from the eye
-SCAN_PICK_COS2 = 0.96                      # and cos^2 of the max angle from the aim direction (about 11.5 degrees)
+SCAN_PICK_COS2 = 0.75                      # and cos^2 of the max angle from the aim direction (30 degrees; was 11.5 until
+                                           # 2026-10-31: the camera tilts up only ~26 degrees, so ceiling cocoons in
+                                           # Temple Sanctuary were out of reach; single player picks anywhere on screen)
 
 
 def scan_search_fallback():
@@ -1525,6 +1890,26 @@ STORED_TARGETS = [(117, 0x1098), (149, 0x9b0), (132, 0x31c), (118, 0x9f0), (113,
                   (134, 0xcd8), (135, 0xf0e), (127, 0xca2)]
 
 
+def emit_nearest_up(a, i, best, mgr, ent):
+    """r`best` = slot of the player nearest entity r`ent` among the players who are up (state +4 & 0x80), r`i`
+    = 0 on entry (loop counter). A downed player held down with no lives left kept the boss on them (playtest
+    2026-10-31). Nobody up: r`best` stays 0 (no swap). Uses r0, r5, r6, f2-f5 and the word at r1+0xc."""
+    a(ppc.lis(0, 0x7149), ppc.stw(0, 0xc, 1), ppc.lfs(5, 0xc, 1))              # f5 = 1e30: no best yet
+    a.label('nu_loop')
+    a(ppc.slwi(6, i, 2), ppc.add(6, 6, mgr), ppc.lwz(5, 0x14f4, 6), ppc.lwz(6, 0x1504, 6), ppc.lbz(6, 4, 6),
+      ppc.andi_(6, 6, 0x80))
+    a.br('beq', 'nu_next')                                                       # down: skip
+    for k in range(3):
+        a(ppc.lfs(2, 0x50 + 4 * k, 5), ppc.lfs(3, 0x50 + 4 * k, ent), ppc.fsubs(2, 2, 3),
+          ppc.fmuls(4, 2, 2) if k == 0 else ppc.fmadds(4, 2, 2, 4))
+    a(ppc.fcmpo(4, 5))
+    a.br('bge', 'nu_next')
+    a(ppc.fmr(5, 4), ppc.mr(best, i))
+    a.label('nu_next')
+    a(ppc.addi(i, i, 1), ppc.lwz(0, 0x14f0, mgr), ppc.cmpw(i, 0))
+    a.br('blt', 'nu_loop')
+
+
 def nearest_player_think(prethink=False):
     """Replaces `bl ENTITY_THINK(r3 = mgr, r4 = entity, f1 = dt)` at 0x80240be8 in the per-frame entity loop.
     With prethink=True it instead replaces the PreThink pass's `bctrl` at 0x80240d50 (FUN_80240c40: r3 =
@@ -1548,20 +1933,7 @@ def nearest_player_think(prethink=False):
     a(ppc.cmpwi(3, 0))
     a.br('beq', 'think')
     a(ppc.li(28, 0))
-    a.label('loop')                       # f5 = best squared distance, r29 = its slot
-    a(ppc.slwi(5, 28, 2), ppc.add(5, 5, 31), ppc.lwz(5, 0x14f4, 5))
-    for k in range(3):
-        a(ppc.lfs(2, 0x50 + 4 * k, 5), ppc.lfs(3, 0x50 + 4 * k, 30), ppc.fsubs(2, 2, 3),
-          ppc.fmuls(4, 2, 2) if k == 0 else ppc.fmadds(4, 2, 2, 4))
-    a(ppc.cmpwi(28, 0))
-    a.br('beq', 'take')
-    a(ppc.fcmpo(4, 5))
-    a.br('bge', 'next')
-    a.label('take')
-    a(ppc.fmr(5, 4), ppc.mr(29, 28))
-    a.label('next')
-    a(ppc.addi(28, 28, 1), ppc.lwz(0, 0x14f0, 31), ppc.cmpw(28, 0))
-    a.br('blt', 'loop')
+    emit_nearest_up(a, 28, 29, 31, 30)
     if STORED_TARGETS and not prethink:   # bosses that remember a player: point it at r29 (main Think only)
         # own type id = immediate of the class's IsA function (vt+0xc: `cmpwi r4,N`), compared without calls
         a(ppc.lwz(3, 0, 30), ppc.lwz(3, 0xc, 3), ppc.lwz(4, 0, 3), ppc.rlwinm(5, 4, 16, 16, 31),
@@ -1636,22 +2008,9 @@ def relevant_player_message():
     a.br('bl', 'find')
     a(ppc.cmpwi(3, 0))
     a.br('bne', 'deliver')
-    a.label('nearest')                    # f5 = best squared distance, r29 = its slot
+    a.label('nearest')
     a(ppc.li(26, 0))
-    a.label('loop')
-    a(ppc.slwi(5, 26, 2), ppc.add(5, 5, 30), ppc.lwz(5, 0x14f4, 5))
-    for k in range(3):
-        a(ppc.lfs(2, 0x50 + 4 * k, 5), ppc.lfs(3, 0x50 + 4 * k, 28), ppc.fsubs(2, 2, 3),
-          ppc.fmuls(4, 2, 2) if k == 0 else ppc.fmadds(4, 2, 2, 4))
-    a(ppc.cmpwi(26, 0))
-    a.br('beq', 'take')
-    a(ppc.fcmpo(4, 5))
-    a.br('bge', 'next')
-    a.label('take')
-    a(ppc.fmr(5, 4), ppc.mr(29, 26))
-    a.label('next')
-    a(ppc.addi(26, 26, 1), ppc.lwz(0, 0x14f0, 30), ppc.cmpw(26, 0))
-    a.br('blt', 'loop')
+    emit_nearest_up(a, 26, 29, 30, 28)
     a.label('deliver')
     a.br('bl', 'swap')
     a(ppc.mr(3, 28), ppc.mr(4, 30), ppc.mr(5, 31), ppc.lwz(12, 0, 28), ppc.lwz(12, 0x18, 12), ppc.mtctr(12), ppc.BCTRL,
@@ -1680,6 +2039,80 @@ def relevant_player_message():
     a(ppc.BLR)
     a.label('end')
     return a.done()
+
+def touch_player_slot(collision=False):
+    """Replaces both Touch `bctrl`s (vt+0x50; r3 = actor, r4 = other, r5 = mgr) in the entity loop's touch pass
+    FUN_80240720 (0x80240918: actor.Touch(other), 0x80240934: other.Touch(actor)). Contact damage in enemy Touch
+    handlers goes to players[0] whoever touched them: player 2 standing among Splinters lost nothing while player
+    1, 35 units away at the door, lost 15.3 per bite and died (live 2026-10-31). Code F's swaps only cover Think,
+    PreThink and messages. For a CPatterned touched by a player with 2+ players, swap that player into slot 0 for
+    the call (players and player states, as code F), then swap back.
+    collision=True: the same for both CollidedWith `bctrl`s (vt+0x88; r3 = actor, r4 = &other's uid, r5 =
+    collision list, r6 = mgr) in FUN_800a49e0 (0x800a4a20 and 0x800a4b90, the other way round), called from the
+    movement collision pass. Small Splinters bite from there: bumping into player 2, they took player 1, 6-8 units
+    away, from 99 to dead in 20 s while player 2 stayed at 99 (live 2026-10-31, after the Touch fix).
+    Frame: 0x10.. saved r27-r31, LR at F+4. r28 actor, r31 other / &uid, r30 mgr, r27 list, r29 slot (0 = none)."""
+    F = 0x30
+    vt = 0x88 if collision else 0x50
+    a = Asm()
+    a(ppc.stwu(1, -F, 1), ppc.mflr(0), ppc.stw(0, F + 4, 1), *[ppc.stw(r, 0x10 + 4 * (r - 27), 1) for r in range(27, 32)],
+      ppc.mr(28, 3), ppc.mr(31, 4), *((ppc.mr(30, 6), ppc.mr(27, 5)) if collision else (ppc.mr(30, 5),)),
+      ppc.li(29, 0), ppc.lwz(0, 0x14f0, 30), ppc.cmpwi(0, 2))
+    a.br('blt', 'call')
+    a(ppc.mr(3, 28), ppc.li(4, PATTERNED))
+    a.call(CAST_ENTITY)
+    a(ppc.cmpwi(3, 0))
+    a.br('beq', 'call')
+    a(ppc.lhz(6, 0 if collision else 8, 31), ppc.li(7, 0))
+    a.label('find')                       # slot whose player uid == the other's uid -> r29
+    a(ppc.lwz(0, 0x14f0, 30), ppc.cmpw(7, 0))
+    a.br('bge', 'call')
+    a(ppc.slwi(5, 7, 2), ppc.add(5, 5, 30), ppc.lwz(5, 0x14f4, 5), ppc.lhz(5, 8, 5), ppc.cmpw(5, 6))
+    a.br('beq', 'hit')
+    a(ppc.addi(7, 7, 1))
+    a.br('b', 'find')
+    a.label('hit')
+    a(ppc.mr(29, 7))
+    a.label('call')
+    a.br('bl', 'swap')
+    a(ppc.mr(3, 28), ppc.mr(4, 31), *((ppc.mr(5, 27), ppc.mr(6, 30)) if collision else (ppc.mr(5, 30),)),
+      ppc.lwz(12, 0, 28), ppc.lwz(12, vt, 12), ppc.mtctr(12), ppc.BCTRL)
+    a.br('bl', 'swap')
+    a(*[ppc.lwz(r, 0x10 + 4 * (r - 27), 1) for r in range(27, 32)], ppc.lwz(0, F + 4, 1), ppc.mtlr(0), ppc.addi(1, 1, F))
+    a.br('b', 'end')
+    a.label('swap')                       # exchange slot 0 and slot r29 of players and player states
+    a(ppc.cmpwi(29, 0), ppc.BEQLR, ppc.slwi(5, 29, 2), ppc.add(5, 5, 30))
+    for base in (0x14f4, 0x1504):
+        a(ppc.lwz(6, base, 30), ppc.lwz(7, base, 5), ppc.stw(7, base, 30), ppc.stw(6, base, 5))
+    a(ppc.BLR)
+    a.label('end')
+    return a.done()
+
+
+def player_index_by_uid():
+    """Entry of FUN_8024ba90(mgr, &uid) -> player index (`uid & 0x3ff` if below the player count, else 0), which
+    code indexes players/states with. Under code F's swaps (Think, messages, Touch, CollidedWith) the player with
+    that uid sits in another slot, so the lookup landed on the other player's state. The kill function
+    FUN_802428e8 clears the alive bit (state +4 & 0x80) through it: a Splinter bite that killed player 2 inside
+    the CollidedWith swap marked player 1 down instead, the rules respawned player 1 (alive, onto player 2) and
+    player 2 stayed up at -8 HP (live 2026-10-31). Returns the slot whose player has that uid; anything else
+    falls through to the original (same answer as before whenever nothing is swapped). Replaces `lhz r4,0(r4)`."""
+    a = Asm()
+    a(ppc.lhz(4, 0, 4), ppc.lwz(0, 0x14f0, 3), ppc.li(11, 0))
+    a.label('loop')
+    a(ppc.cmpw(11, 0))
+    a.br('bge', 'end')
+    a(ppc.slwi(12, 11, 2), ppc.add(12, 12, 3), ppc.lwz(12, 0x14f4, 12), ppc.cmpwi(12, 0))
+    a.br('beq', 'next')
+    a(ppc.lhz(12, 8, 12), ppc.cmpw(12, 4))
+    a.br('bne', 'next')
+    a(ppc.mr(3, 11), ppc.BLR)
+    a.label('next')
+    a(ppc.addi(11, 11, 1))
+    a.br('b', 'loop')
+    a.label('end')
+    return a.done()
+
 
 # Each code: words = {addr: (orig, new, what)}; hooks = [(site, orig, body, what)]
 CODES = {
@@ -1739,6 +2172,11 @@ CODES = {
         name='Echoes co-op: Scan Visor works and no friendly fire',
         words=scan_in_multiplayer(),
         hooks=[(0x80149ee8, 0x48101615, scan_text_box(), 'Scan: show scan text in the message box under MP'),
+               (ZMODE_SITE, ZMODE_ORIG, scan_hud_zmode(), 'Scan HUD: no z compare while its frame is drawn (flag)'),
+               (SCAN_HUD_DRAW, 0x482c51b5, scan_hud_draw(), "Scan HUD: set that flag around its frame's draw"),
+               *([(0x80149d68, 0x4810146d, scan_pause_owner(), "Scan summary option: only the scanner's scan ends its pause"),
+                  (0x80170844, 0x2c180002, scan_pause_picture(), 'Scan summary option: keep the box picture in its pause')]
+                 if SCAN_SUMMARY_TEST else []),
                (0x8024abb4, 0x2c030000, message_state_gate(), 'Pause state: allow message box/close under MP'),
                (0x800ddc28, 0x7c070000, message_input_any_remote(), 'Message box: any Wii Remote can advance it'),
                (MODIFY_DAMAGE, 0x9421ffa0, no_friendly_fire(), 'Damage: players cannot hurt players'),
@@ -1748,14 +2186,24 @@ CODES = {
         words={},
         hooks=[(0x801e6bf8, 0x480000f5, any_player_crossed(), 'Dock: any player crossing switches the room'),
                (0x801e6a5c, 0x4bfff93d, follow_on_door_close(), 'Door closed: bring players still behind it'),
-               (0x801db1f8, 0x807f1514, stop_camera_for_every_player(), 'Camera stop: check every player camera manager')]),
+               (0x801db1f8, 0x807f1514, stop_camera_for_every_player(), 'Camera stop: check every player camera manager'),
+               (0x80076320, 0x48097209, rescue_stranded_player(), 'Every frame: bring a player outside every loaded room to a partner')]),
     'F': dict(
         name='Echoes co-op: enemies fight the nearest player (not only player 1)',
-        words={},
+        # ApplyLocalDamage skips a player whose camera manager runs a cinematic (+0x12 != invalid), taking the
+        # manager at the player's index; managers aren't swapped, so with player_index_by_uid a swapped bite
+        # checked player 1's manager (code D puts cinematics there): player 2 lost nothing to 8 bites while a
+        # stale cinematic camera sat in player 1's manager (live 2026-10-31). Ask the player's own manager.
+        words={0x80242f84: (0x80631514, ppc.lwz(3, 0x12f0, 28), "Damage: cinematic check uses the player's own camera manager")},
         hooks=[(0x80240be8, 0x4bfffdad, nearest_player_think(), 'Entity loop: nearest player is players[0] during enemy Think'),
                (0x80240d50, 0x4e800421, nearest_player_think(prethink=True), 'PreThink loop: same during enemy PreThink'),
                (0x8024b3d0, 0x4e800421, relevant_player_message(), 'Messages (immediate): relevant player is players[0] for enemies'),
-               (0x80244c70, 0x4e800421, relevant_player_message(), 'Messages (queued, incl. damage): same')]),
+               (0x80244c70, 0x4e800421, relevant_player_message(), 'Messages (queued, incl. damage): same'),
+               (0x80240918, 0x4e800421, touch_player_slot(), 'Touch: the touching player is players[0] for enemies'),
+               (0x80240934, 0x4e800421, touch_player_slot(), 'Touch (other way round): same'),
+               (0x800a4a20, 0x4e800421, touch_player_slot(True), 'CollidedWith: the colliding player is players[0] for enemies'),
+               (0x800a4b90, 0x4e800421, touch_player_slot(True), 'CollidedWith (other way round): same'),
+               (0x8024ba90, 0xa0840000, player_index_by_uid(), 'Player index from uid: follow the swaps')]),
     'G': dict(
         name='Echoes co-op: save stations work (needs code E for the save screen)',
         # SaveStation special function (type 7) ACTN handler FUN_8020e800: `if (IsMultiplayer(mgr)) return;`
@@ -1766,7 +2214,12 @@ CODES = {
         name='Echoes co-op: item pickups go to every player',
         # Pickup Think FUN_801f7d04: a charging player pulls pickups in from 30 units in single player but only
         # 12 under MP rules (`bl IsMP` @0x801f88f8 picks -0x7594(r13) = 12.0 over -0x7598(r13) = 30.0).
-        words={0x801f8900: (0x4182000c, ppc.b(0x801f8900, 0x801f890c), 'Charge beam: pull pickups from 30 units (SP range)')},
+        words={0x801f8900: (0x4182000c, ppc.b(0x801f8900, 0x801f890c), 'Charge beam: pull pickups from 30 units (SP range)'),
+               # FUN_801f92f8 marks every pickup a generator spawns (crate and enemy drops: +0x1c8 |= 1) and makes it
+               # attractable (|= 0x80, which the charge pull requires) only when not multiplayer; co-op runs as
+               # multiplayer, so drops couldn't be pulled (playtest 2026-11-02; live after: real Splinter drops pulled
+               # from 12 units by either player)
+               0x801f9318: (0x40820010, ppc.NOP, 'Charge beam: drops from crates and enemies can be pulled')},
         hooks=[(PICKUP_TOUCH_AFTER_GRANT, 0x1c19000c, shared_pickup(), 'Pickup: give it to every player')]),
     'I': dict(
         name='Echoes co-op: scan progress is shared',
@@ -1797,6 +2250,7 @@ CODES = {
                (0x80157c14, 0x4e800421, map_skip_backdrop(), 'Map: no backdrop panel with 2+ players'),
                (0x80157c84, 0x38800006, map_depth_always(), 'Map: ignore world depth with 2+ players'),
                (0x80157cbc, 0x48210579, map_placement(), 'Map: usable placement with 2+ players'),
+               (0x80157c7c, 0x4e800421, minimap_skip_panel(), 'Map: no pale panel behind the SP HUD corner minimap'),
                (0x800e8cf4, 0x4bff4e11, data_network_hud0(), 'Data Network: player 1 HUD only (full screen, any controller)'),
                (0x800e82d8, 0x38800003, data_network_open(), 'Pause button: Data Network (state 4), remember who opened it')]),
     'L': dict(
@@ -1807,7 +2261,9 @@ CODES = {
                (0x8024ac68, 0x9421ffd0, lives_refill_on_save(), "'Saved' message after a save: refill the pool"),
                (0x80076414, 0xc0170000, lives_unfade_partners(), 'Dead player: keep the other players lit'),
                (0x8024b844, 0x57e0103a, lives_spectate(), 'Out of lives: show the view of a player who is up'),
-               (0x800dd9cc, 0x57e01838, lives_spectate_hud(), 'Out of lives: and the HUD of that player')]),
+               (0x800dd9cc, 0x57e01838, lives_spectate_hud(), 'Out of lives: and the HUD of that player'),
+               (0x80157d6c, 0x408103bc, hud_death_cover(), 'Player 1 down: map, Data Network and messages still show'),
+               (0x8020c6b8, 0x833b0004, spawn_point_skip_down(), 'Spawn point teleports: leave downed players where they fell')]),
     'J': dict(
         name='Echoes co-op: upgrades given by scripts go to every player',
         words={},
@@ -1826,7 +2282,7 @@ def far_jump(target):
     return [*ppc.load32(12, target), ppc.mtctr(12), 0x4e800420]
 
 
-INLINE_SITES = {0x800ddc28, 0x80157c14, 0x80157c84}                # CTR is live there (the dispatcher's bdnz loop): keep the body in the
+INLINE_SITES = {0x800ddc28, 0x80157c14, 0x80157c84, 0x80157c7c}    # CTR is live there (the dispatcher's bdnz loop): keep the body in the
                                            # Gecko list, where Dolphin's C2 returns with a plain branch
 
 
@@ -1849,10 +2305,11 @@ def gecko_lines(*keys):
     """One Gecko code (one gate, one terminator) holding the given features: the gate, single-word patches,
     and per hook a C2 stub that far-jumps to its body in MEM2 (onframe_lines() writes the bodies). Dolphin's
     code list must end below 0x80003000; keeping only stubs there leaves room for more features."""
-    lines = [f'20{a & 0x1ffffff:06X} {v:08X}' for a, v in GATE.items()]    # nested 32-bit "if equal" (AND)
+    lines = gate_lines()                                                 # nested 32-bit "if equal" (AND)
     for key in keys:
         for a, (_, new, _) in CODES[key]['words'].items():
             lines.append(f'04{a & 0x1ffffff:06X} {new:08X}')
+        lines += CODES[key].get('lines', [])                             # raw Gecko lines (own if/endif pairs)
     stubs = [(site, far_jump(addr)) for _, site, _, addr, _, _ in hook_layout(keys)]
     stubs += [(site, list(body)) for key in keys for site, _, body, _ in CODES[key]['hooks'] if site in INLINE_SITES]
     for site, words in stubs:
@@ -1867,7 +2324,8 @@ def onframe_lines(*keys):
     """Dolphin [OnFrame] patch lines writing every hook body to MEM2 (Dolphin applies them on the host each
     frame, so their size does not count against the Gecko code area). Inert until a gated stub jumps there."""
     return [f'0x{addr + 4 * i:08X}:dword:0x{w:08X}' for _, _, _, addr, words, _ in hook_layout(keys)
-            for i, w in enumerate(words)]
+            for i, w in enumerate(words)] + [f'0x{addr:08X}:dword:0x{w:08X}' for key in (keys or CODES)
+                                              for addr, w in sorted(CODES[key].get('onframe', {}).items())]
 
 
 COMBINED_NAME = 'Echoes co-op (all features: ' + ', '.join(CODES) + ')'
@@ -1890,9 +2348,106 @@ def difficulty_name(name):
 
 
 def difficulty_lines(name):
-    lines = [f'20{a & 0x1ffffff:06X} {v:08X}' for a, v in GATE.items()]
+    lines = gate_lines([DIFFICULTY_SITE])
     lines.append(f'04{DIFFICULTY_SITE & 0x1ffffff:06X} {ppc.li(3, DIFFICULTIES[name][0]):08X}')
     return lines + ['E0000000 80008000']
+# Option: the single-player HUD in co-op. The HUD layout (FUN_8024ba68: 0 for 1 player, 1 for 2, 2 for 3-4)
+# picks the combat/ball frames (RS5_SamusHud1Combat ...), the scan HUD and radar sizes, and only layout 0 loads the
+# helmet frame (FRME_RS5_Helmet) and sets HUD +4 (single-player HUD). Each `bl FUN_8024ba68` below -> `li r3,0`.
+# The message frame (0x800dd0cc), scoreboard, turret HUD, MP menu and the 2-player projection (0x80018894) keep
+# the real layout, and so does the scan HUD (0x800d32ec frame, 0x800d382c widgets). Player 2's missing "Scanning..."
+# text and progress bar (playtest 2026-11-01) came from the scan box's depth, not the frames: see scan_hud_zoff_lines.
+SP_HUD_NAME = 'Echoes co-op option: single-player HUD (helmet, minimap, boss health bar)'
+SP_HUD_SITES = {0x800dd034: 'combat and ball frames', 0x800dd220: 'helmet frame', 0x80156db4: 'HUD +4 flag',
+                0x80171010: 'radar size',
+                # the HUD rebuild after leaving / entering Morph Ball picks its frames again (the SP HUD was lost
+                # after morphing, playtest 2026-11-01); found by scanning the code for every call
+                0x8019de68: 'combat frame (rebuild)', 0x8019dd7c: 'ball frame (rebuild)',
+                0x80173494: 'radar size (draw)', 0x800d24e0: 'radar widget size',
+                0x8019c7b8: 'SP-only HUD update (follows the camera)', 0x801a1c9c: 'SP-only HUD frame transforms'}
+
+
+def c2_lines(site, words):
+    words = words + ([ppc.NOP, 0] if len(words) % 2 == 0 else [0])
+    return [f'C2{site & 0x1ffffff:06X} {len(words) // 2:08X}'] + [f'{words[i]:08X} {words[i + 1]:08X}'
+                                                                   for i in range(0, len(words), 2)]
+
+
+def sp_hud_lines():
+    lines = gate_lines(SP_HUD_SITES)
+    lines += [f'04{a & 0x1ffffff:06X} {ppc.li(3, 0):08X}' for a in SP_HUD_SITES]
+    return lines + ['E0000000 80008000']
+
+
+# Option: single player's scan summary. After a scan, single player pauses the world (mgr +0x1e88, ScanPause
+# FUN_8024b1d4) and the scanning player's scan frame pages through the text, then the logbook category path with
+# its progress (basewidget_crazy%d: textpane_history name, textpane_number %, barmeter_percent). Co-op shows the
+# text in a message box instead (scan_text_box), and closing a message box also ends a scan pause. With the option
+# on, scan_text_box takes the single-player path and code D shows the scanning player full screen while it lasts
+# (emit_scan_pause_mode). The option's words: single player's scan frame (FRME_ScanHudFlat, which has the category
+# widgets; the multiplayer frame's lack made the page builder read 0x6c, PC 0x8039b5a0, 2026-11-01) and its bar
+# callback, and the two MP gates of the category pages (the builder's `bne` at 0x801b3118 after IsMultiplayer, and
+# the caller's `bl IsMultiplayer` at 0x800d4184 whose negation it passes as 'show categories'; SCAN_SUMMARY_SITE).
+# FUN_8014c684's logbook-totals message (MP-gated at 0x8014c6b0) is left off: in co-op it opened an empty message box.
+SCAN_SUMMARY_NAME = 'Echoes co-op option: single-player scan screen (logbook progress after a scan)'
+SCAN_SUMMARY_WORDS = {0x800d32ec: (0x4817877d, ppc.li(3, 0)), 0x800d382c: (0x4817823d, ppc.li(3, 0)),
+                      0x801b3118: (0x408204bc, ppc.NOP), SCAN_SUMMARY_SITE: (0x48177379, SCAN_SUMMARY_ON)}
+# The scan frame copies the HUD frame root's position when it loads (FUN_800d35d4, `lfs f1,0x94(r5)` at 0x800d3660:
+# the depth). Single player's HUD frame puts it at -19.5; the multiplayer one at about -38, where single player's scan
+# frame came out too large (the text box off the bottom of the full-screen pane, live 2026-11-02); -50 fits it as in
+# single player. Uses r0 and the stack slot the depth is stored to just after.
+SCAN_ROOT_SITE, SCAN_ROOT_ORIG = 0x800d3660, 0xc0250094
+
+
+def scan_root_depth():
+    a = Asm()                              # the depth sways a little: test its top half, -36 to -40
+    a(SCAN_ROOT_ORIG, ppc.lwz(0, 0x94, 5), (21 << 26) | (16 << 11) | (16 << 6) | (31 << 1), ppc.cmplwi(0, 0xc210))
+    a.br('blt', 'keep')                    # (rlwinm r0,r0,16,16,31)
+    a(ppc.cmplwi(0, 0xc220))
+    a.br('bge', 'keep')
+    a(ppc.lis(0, 0xc248), ppc.stw(0, 0x24, 1), ppc.lfs(1, 0x24, 1))                  # f1 = -50.0
+    a.label('keep')
+    return a.done()
+
+
+def scan_summary_lines():
+    lines = gate_lines([*SCAN_SUMMARY_WORDS, SCAN_ROOT_SITE])
+    lines += [f'04{a & 0x1ffffff:06X} {new:08X}' for a, (orig, new) in SCAN_SUMMARY_WORDS.items()]
+    return lines + c2_lines(SCAN_ROOT_SITE, scan_root_depth()) + ['E0000000 80008000']
+
+
+def option_lines(words):
+    lines = gate_lines(words)
+    lines += [f'04{a & 0x1ffffff:06X} {new:08X}' for a, (orig, new) in words.items()]
+    return lines + ['E0000000 80008000']
+
+
+# Option: only player 1 is seen in cutscenes. CPlayer AddToRenderer (vt+0x28, FUN_80148398) skips the player when
+# +0x1243 & 0x08 is set (`lbz r0,0x1243(r3)` at 0x801483b4, skip to 0x80148404). Replace that load: with 2+ players,
+# while player 1's camera manager runs a cinematic (code D puts every cinematic there) skip every other player.
+CUTSCENE_SOLO_NAME = 'Echoes co-op option: only player 1 appears in cutscenes'
+CUTSCENE_SOLO_SITE, CUTSCENE_SOLO_ORIG = 0x801483b4, 0x88031243
+
+
+def cutscene_solo_body():
+    a = Asm()
+    a(*ppc.load32(11, SM_ADDR), ppc.lwz(12, 0x14f0, 11), ppc.cmpwi(12, 2))
+    a.br('blt', 'keep')
+    a(ppc.lwz(12, 0x14f4, 11), ppc.cmpw(12, 3))
+    a.br('beq', 'keep')
+    a(ppc.lwz(12, 0x1514, 11), ppc.lhz(12, 0x12, 12), ppc.cmplwi(12, 0xffff))
+    a.br('beq', 'keep')
+    a(*far_to(0x80148404))
+    a.label('keep')
+    a(CUTSCENE_SOLO_ORIG)
+    return a.done()
+
+
+def cutscene_solo_lines():
+    lines = gate_lines([CUTSCENE_SOLO_SITE])
+    return lines + c2_lines(CUTSCENE_SOLO_SITE, cutscene_solo_body()) + ['E0000000 80008000']
+
+
 BODIES_NAME = 'Echoes co-op hook code (needed by the Gecko code of the same name)'
 CODE_LIST_START, CODE_LIST_END = 0x80002338, 0x80003000    # Dolphin's list after its code handler
 
@@ -1903,7 +2458,8 @@ def enabled_keys():
 
 def combined_lines():
     lines = gecko_lines(*enabled_keys())
-    end = CODE_LIST_START + 8 + 8 * (len(lines) + len(difficulty_lines(DEFAULT_DIFFICULTY))) + 8
+    end = CODE_LIST_START + 8 + 8 * (len(lines) + len(difficulty_lines(DEFAULT_DIFFICULTY)) + len(sp_hud_lines())
+                                     + len(scan_summary_lines()) + len(cutscene_solo_lines())) + 8
     assert end <= CODE_LIST_END, f'combined code ends at {end:#x}, past {CODE_LIST_END:#x}: Dolphin would drop it'
     return lines
 
@@ -1927,7 +2483,16 @@ def install_gecko():
     body += [f'*{k}: {c["name"]}' for k, c in CODES.items()] + combined_lines()
     for name, (_, what) in DIFFICULTIES.items():
         body += [f'${difficulty_name(name)}', f'*{what}'] + difficulty_lines(name)
+    body += [f'${SP_HUD_NAME}', '*Off by default. Each half shows the single-player HUD squashed to half height'] + sp_hud_lines()
+    body += [f'${SCAN_SUMMARY_NAME}', "*Off by default. The scanning player's view goes full screen while it shows"] +         scan_summary_lines()
+    body += [f'${CUTSCENE_SOLO_NAME}', '*Off by default. Players 2-4 are hidden while a cutscene plays'] +         cutscene_solo_lines()
     body += ['[Gecko_Enabled]', f'${COMBINED_NAME}', f'${difficulty_name(DEFAULT_DIFFICULTY)}']
+    if os.environ.get('COOP_SP_HUD'):           # testing aid: enable the option
+        body.append(f'${SP_HUD_NAME}')
+    if os.environ.get('COOP_SCAN_SUMMARY'):
+        body.append(f'${SCAN_SUMMARY_NAME}')
+    if os.environ.get('COOP_CUTSCENE_SOLO'):
+        body.append(f'${CUTSCENE_SOLO_NAME}')
     body += ['[OnFrame]', f'${BODIES_NAME}'] + onframe_lines(*enabled_keys())
     body += ['[OnFrame_Enabled]', f'${BODIES_NAME}']
     open(ini, 'w').write('\n'.join([l for l in keep if l.strip()] + body) + '\n')
